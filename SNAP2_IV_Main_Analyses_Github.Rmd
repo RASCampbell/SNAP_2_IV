@@ -7,6 +7,8 @@ output: html_document
 
 This script was run using R Version 4.0.3 in RStudio Version 1.2.5033. It utilises results generated from Stata scripts run using Stata Release 17. 
 
+NB - Please note that ICU (Intensive Care Unit) & CCU (Critical Care Unit) are used interchangeably throughout this script. As per the Methods section of the manuscript, they both refer to any of an Intensive Care Unit, High Dependency Unit, Post-Anaesthetic Recovery Unit or an Overnight Intensive Recovery Unit. 
+
 # Load libraries needed
 ```{r}
 library(tidyverse)
