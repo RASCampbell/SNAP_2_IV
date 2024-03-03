@@ -1,0 +1,1863 @@
+---
+title: "R markdown script for main analysis of SNAP2 data - for Github repo"
+author: "Ruaraidh Campbell"
+date: '2023-10-18'
+output: html_document
+---
+
+This script was run using R Version 4.0.3 in RStudio Version 1.2.5033. It utilises results generated from Stata scripts run using Stata Release 17. 
+
+# Load libraries needed
+```{r}
+library(tidyverse)
+library(readxl)
+library(finalfit)
+library(Hmisc)
+library(naniar)
+library(sjPlot)
+library(broom)
+library(arm)
+library(readr)
+library(margins)
+library(parameters)
+library(sandwich)
+library(lmtest)
+library(estimatr)
+library(miceadds)
+library(pROC)
+```
+
+# Load in raw data and create variables {.tabset}
+
+# Load in the raw data for the SNAP 2 study and merge into one master dataset
+Datasets: 
+1. SNAP2_combined_clean_anonymised.Rdata (AKA patients_clean) = the main SNAP2 data collected using the CRF
+2. occupancy_long_clean_combined.rds = data on critical care occupancy at the time of surgery (e.g. number of empty beds, treated patients and dischargeable patients - each at 8AM and 8PM each day)
+3. SNAP2_procedurelist_specialty_coded.csv = a list of the surgical procedures and how they relate to speciality, severity/complexity of surgery
+
+```{r, message=F, warning=F}
+load(file='SNAP2_combined_clean_anonymised.Rdata')
+
+occupancy <- readRDS(file='occupancy_long_clean_combined.rds')
+
+#change patients_clean$S02StudyDay from ordered factor to non-ordered factor to allow joining of datasets
+patients_clean$S02StudyDay <- factor(patients_clean$S02StudyDay, ordered = FALSE) 
+
+# join patients_clean and occupancy
+patients_clean <- patients_clean %>% 
+  left_join(occupancy, by = c("SiteCode" = "SiteCode", "S02StudyDay" = "StudyDay"))
+
+# join patients_clean (with occupancy) and procedure data
+SNAP2_procedurelist_specialty_coded <- read_csv("SNAP2_procedurelist_specialty_coded.csv")
+procedures <- SNAP2_procedurelist_specialty_coded %>% dplyr::select(Code, Specialty)
+patients_clean <- patients_clean %>% left_join(procedures, by = c("S02PlannedProcedure" = "Code"))
+```
+
+# Create treatment variable (ICU vs. Non-ICU)
+**Treatment variable:**
+```{r}
+patients_clean <- patients_clean %>%
+  mutate(icu_adm = (S07PlannedDayOfSurgeryIcuHduPacuAdmission == "Y" | S07UnplannedDayOfSurgeryIcuHduPacuAdmission == "Y"))
+```
+
+# Create outcome variables
+
+## Outcome: POMS (already in dataset)
+
+## Outcome: Mortality
+Create mortality variable
+```{r}
+patients_clean <- patients_clean %>% mutate(S07StillInHospitalPrimaryAdmissionAfterSurgery = replace(S07StillInHospitalPrimaryAdmissionAfterSurgery,
+                                                                                                       which(is.na(S07StillInHospitalPrimaryAdmissionAfterSurgery) & S05PatientStillAliveAndInHospital == "N"), "N")) %>%
+  mutate(S07StatusAtDischarge = replace(S07StatusAtDischarge, which(is.na(S07StatusAtDischarge) & S05StatusAtDischarge == "A"), "A")) %>%
+  mutate(S07StatusAtDischarge = replace(S07StatusAtDischarge, which(is.na(S07StatusAtDischarge) & S05StatusAtDischarge == "D"), "D")) %>%
+  mutate(postmort30 = (S07PostopLOS <= 30 & S07StatusAtDischarge == "D")) %>%
+  mutate(postmort30 = replace(postmort30, which(is.na(postmort30) & S07StillInHospitalPrimaryAdmissionAfterSurgery == "Y"), FALSE)) %>%
+  mutate(postmort60 = S07PostopLOS <= 60 & S07StatusAtDischarge == "D") %>%
+  mutate(postmort60 = replace(postmort60, which(is.na(postmort60) & S07StillInHospitalPrimaryAdmissionAfterSurgery == "Y"), FALSE))
+```
+
+
+## Create variables of interest based on occupancy data
+
+- Create variable "EmptyBedsTimeofSurgery" which is the number of empty beds at the time of surgery.
+- Create variable "CCUCapacityTimeofSurgery" which is the sum out of empty beds and dischargeable patients at the time of surgery.
+- Create variable "TotalCapacityTimeofSurgery" which is the sum out of empty beds, dischargeable patients and treated patients at the time of surgery.
+- If surgery was started between 8AM-4PM, ICU occupancy data from 8AM was used.
+- If surgery was started between 4PM-8AM, ICU occupancy data from 8PM was used.
+
+```{r}
+patients_clean <- patients_clean %>%
+  mutate(CCUCapacityTimeofSurgery = 
+           ifelse(S02TimeOfSurgeryStartIncision %in% c("8", "12", "16"), 
+                  (EmptyBeds0800 + DischargeReady0800),
+                  ifelse(S02TimeOfSurgeryStartIncision %in% c("20"), 
+                         (EmptyBeds2000 + DischargeReady2000),
+                         ifelse(S02TimeOfSurgeryStartIncision %in% c("0", "4"),
+                                (EmptyBeds2000 + DischargeReady2000), NA)))) %>%
+  mutate(EmptyBedsTimeofSurgery = 
+           ifelse(S02TimeOfSurgeryStartIncision %in% c("8", "12", "16"), 
+                  EmptyBeds0800,
+                  ifelse(S02TimeOfSurgeryStartIncision %in% c("20"), 
+                         EmptyBeds2000,
+                         ifelse(S02TimeOfSurgeryStartIncision %in% c("0", "4"),
+                                EmptyBeds2000, NA)))) %>%
+  mutate(EmptyBedsTimeofSurgCat = ifelse(EmptyBedsTimeofSurgery == 0, 
+                                         "0",
+                                         ifelse(EmptyBedsTimeofSurgery == 1, 
+                                                "1",
+                                                ifelse(EmptyBedsTimeofSurgery > 1, 
+                                                       "2 or more", NA)))) %>%
+  mutate(PropEmptyTimeofSurgery = 
+           ifelse(S02TimeOfSurgeryStartIncision %in% c("8", "12", "16"), 
+                  (PropEmpty0800),
+                  ifelse(S02TimeOfSurgeryStartIncision %in% c("20"), 
+                         (PropEmpty2000),
+                         ifelse(S02TimeOfSurgeryStartIncision %in% c("0", "4"),
+                                (PropEmpty2000), NA)))) %>%
+    mutate(TotalCapacityTimeofSurgery = 
+           ifelse(S02TimeOfSurgeryStartIncision %in% c("8", "12", "16"), 
+                  (TotalCapacity0800),
+                  ifelse(S02TimeOfSurgeryStartIncision %in% c("20"), 
+                         (TotalCapacity2000),
+                         ifelse(S02TimeOfSurgeryStartIncision %in% c("0", "4"),
+                                (TotalCapacity2000), NA))))
+```
+
+## Clean/recode variables
+
+```{r}
+# Recode radiology findings
+patients_clean <- patients_clean %>%  mutate_at(vars(S03RadiologicalFindings),
+                                                funs(recode_factor(.,
+                                                                   `Y` = TRUE,
+                                                                   `N` = FALSE,
+                                                                   `TRUE` = TRUE,
+                                                                   `FALSE` = FALSE))) %>% 
+# Recode ecg findings into normal vs abnormal
+  mutate(ecg = recode_factor(S03EcgFindings,
+                                                                `NOR` = "Normal",
+                                                                `ND` = "Not done",
+                                                                `4E` = "Abnormal",
+                                                                `AF>90` = "Abnormal",
+                                                                `AF6090` = "Abnormal",
+                                                                `O` = "Abnormal",
+                                                                `QW` = "Abnormal",
+                                                                `ST` = "Abnormal")) %>% 
+# Recode pre-op team estimate of mortality into percentage risks and relevel
+  mutate(periop_team_mort_estimate.factor = 
+           factor(S03PerioperativeTeamOfTheRiskOfDeathWithin30Days) %>% 
+           fct_recode(
+             "<1%" = "L1",
+             "1-2.5%" = "L2",
+             "2.6-5%" = "L6",
+             "5.1-10%" = "L10",
+             "10.1-50%" = "L50",
+             ">50%" = "G50", 
+             "NA" = "NA"
+           ) %>% 
+           fct_relevel("<1%", "1-2.5%", "2.6-5%", "5.1-10%", "10.1-50%",">50%"), 
+# Recode pre-op dyspnoea and relevel         
+         dyspnoea.factor = factor(S03Dyspnoea) %>% 
+           fct_recode(
+             "None" = "Non",
+             "On exertion" = "OME",
+             "Limiting activities" = "L",
+             "At rest" = "AR"
+           ) %>% 
+           fct_relevel("None", "On exertion", "Limiting activities", "At rest"), 
+# Recode if op was for malignancy and relevel
+         malignancy.factor = factor(S04Malignancy) %>% 
+           fct_recode(
+             "Not malignant" = "NM",
+             "Primary malignancy only" = "PM",
+             "Malignancy + nodal mets" = "MNM",
+             "Malignancy + distant mets" = "MDM"
+           ) %>% 
+           fct_relevel("Not malignant", "Primary malignancy only", "Malignancy + nodal mets", "Malignancy + distant mets"),
+# Recode peritoneal contamination and relevel
+           peritoneal_contamination.factor = factor(S04PeritonealContamination) %>% 
+           fct_recode(
+             "Not applicable" = "NA",
+             "No soiling" = "NS",
+             "Minor soiling" = "MS",
+             "Local pus" = "LP", 
+             "Free bowel content, pus or blood" = "FBC"
+           ) %>% 
+           fct_relevel("Not applicable", "No soiling", "Minor soiling", "Local pus", "Free bowel content, pus or blood"),
+           ) %>% 
+# Recode surgery start time into the actual time slots 
+   mutate(surgery_start_time.factor = 
+           factor(S02TimeOfSurgeryStartIncision) %>% 
+           fct_recode(
+             "00:00-04:00" = "0",
+             "04:00-07:59" = "4",
+             "08:00-11:59" = "8",
+             "12:00-15:59" = "12",
+             "16:00-19:59" = "16",
+             "20:00-23:59" = "20"
+           )) %>% 
+# Recode surgery end time into the actual time slots   
+  mutate(surgery_end_time.factor = 
+           factor(S04SurgeryEndTimePeriods) %>% 
+           fct_recode(
+             "00:00-04:00" = "0",
+             "04:00-07:59" = "4",
+             "08:00-11:59" = "8",
+             "12:00-15:59" = "12",
+             "16:00-19:59" = "16",
+             "20:00-23:59" = "20"
+           )) %>% 
+# Recode number of procedures and relevel (collapse >2 and GT>2 into just >2)   
+   mutate(procedure_count.factor = 
+           factor(S04ProcedureCount)) %>% 
+   mutate(procedure_count.factor = fct_collapse(
+     procedure_count.factor, 
+     ">2" = c(">2", "GT2")) %>% 
+      fct_relevel("1", "2", ">2") 
+   ) %>% 
+# Create variable "combined_PMHx" which returns "1" if a patient had any of the comobdities asked about in the CRF   
+  mutate(combined_PMHx = ifelse(S03PastMedicalHistoryCoronaryArteryDisease == "Y" | S03PastMedicalHistoryCongestiveCardiacFailure == "Y" |
+                                S03PastMedicalHistoryCancerLast5Yrs == "Y" | S03PastMedicalHistoryMetastaticCancerCurrent == "Y" |
+                                S03PastMedicalHistoryStrokeTIA == "Y" | S03PastMedicalHistoryDementia == "Y" |
+                                S03PastMedicalHistoryCOPD == "Y" | S03PastMedicalHistoryPulmonaryFibrosis == "Y" |
+                                S03PastMedicalHistoryLiverCirrhosis == "Y" | S03PastMedicalHistoryRenalDisease == "Y" |
+                                S03PastMedicalHistoryComplexPolytrauma == "Y", 1, 0)) %>%
+  
+  # Create variable "PMHx_query_other" which returns "1" if a patient did not have any of the comorbdities asked about in the CRF, but there PMHx = none option was not ticked. 
+  mutate(PMHx_query_other = ifelse(S03PastMedicalHistoryNone == 2 & (combined_PMHx == 0 | is.na(combined_PMHx)), 1, 0)) %>%
+  
+  # Create variable "PMHx_combined_and_query_other" which returns "1" if a patient did not have any of the comobdities asked about in the CRF, but there PMHx = none option was not ticked OR they had one of the comorbidities. 
+  mutate(PMHx_combined_and_query_other = ifelse(combined_PMHx == 1 | PMHx_query_other == 1, 1, 0)) %>% 
+  
+# Create variable "combined_DHx" which returns "1" if a patient was taking any of the medications asked about in the CRF 
+  mutate(combined_DHx = ifelse(S03DrugTreatmentDiureticTreatment == "Y" | S03DrugTreatmentAntiAnginal == "Y" |
+                                S03DrugTreatmentDigoxinTherapy == "Y" | S03DrugTreatmentAntiHypertensive == "Y" |
+                                S03DrugTreatmentWarfarin == "Y" | S03DrugTreatmentOther== "Y" , 1, 0)) %>% 
+# Categorise BMI into weight ranges 
+   mutate(
+    BMI.factor = 
+      S03BodyMassIndexBmi %>%
+      cut(breaks = c(1,18.5,24.99,30,40,100), include.lowest = TRUE) %>% 
+      fct_recode(
+        "Underweight"      =  "[1,18.5]",
+        "Healthy weight" = "(18.5,25]",
+        "Overweight" = "(25,30]",
+        "Obese"      = "(30,40]", 
+        "Severely obese" = "(40,100]"
+      )
+  ) %>%   
+# Create variable "combined_radiology_findings" which combines the information from all the TRUE/FALSE radiology variables into one column   
+   mutate(combined_radiology_findings = 
+           case_when(S03RadiologicalFindings == "TRUE" & S03RadiologicalFindingsNormal %in% "Y" ~ "Normal", 
+                     S03RadiologicalFindings == "TRUE" & S03RadiologicalFindingsConsolidation %in% "Y" ~ "Consolidation",
+                     S03RadiologicalFindings == "TRUE" & S03RadiologicalFindingsCardiomegaly %in% "Y" ~ "Cardiomegaly", 
+                     S03RadiologicalFindings == "TRUE" & S03RadiologicalFindingsOtherAbnormality %in% "Y" ~ "Other abnormality",
+                     S03RadiologicalFindings == "FALSE" ~ "CXR not done", 
+                     S03RadiologicalFindings == "TRUE" & (is.na(S03RadiologicalFindingsNormal) & is.na(S03RadiologicalFindingsCardiomegaly) & is.na(S03RadiologicalFindingsConsolidation) & is.na(S03RadiologicalFindingsOtherAbnormality)) ~ NA)
+) %>% 
+# Create variable "combined_anaesthetics type" which combines the information from all the TRUE/FALSE anaesthetic type variables into one column 
+     mutate(combined_anaesthetic_type = 
+           case_when(S04AnaestheticTechniqueGeneral %in% "TRUE" ~ "GA", 
+                     S04AnaestheticTechniqueSedationDeep %in% "TRUE" ~ "Sedation Deep",
+                     S04AnaestheticTechniqueSedationLight %in% "TRUE" ~ "Sedation light", 
+                     S04AnaestheticTechniqueEpidural %in% "TRUE" ~ "Epidural", 
+                     S04AnaestheticTechniqueSpinal %in% "TRUE" ~ "Spinal", 
+                     S04AnaestheticTechniqueSpinalEpidural %in% "TRUE" ~ "Combined spinal/epidural",
+                     S04AnaestheticTechniqueRegional %in% "TRUE" ~ "Regional", 
+                     S04AnaestheticTechniqueLocalInfiltration %in% "TRUE" ~ "Local infiltration")) %>% 
+#Create variable where POMS/mortality is a factor rather than logical (i.e. TRUE/FALSE) to allow functions such as summary_factorlist from finalfit package to work later on in baseline characteristic tables
+  mutate(POMS.factor = factor(POMS)) %>% 
+  mutate(mortality30.factor = factor(postmort30)) %>% 
+  mutate(mortality60.factor = factor(postmort60)) %>% 
+  mutate(icu_adm.factor = factor(icu_adm))
+
+
+#Create weekend vs weekday variable 
+patients_clean <- patients_clean %>% 
+  mutate(weekend = ifelse(S02StudyDay == "Sat" | S02StudyDay == "Sun", 1, 0)) %>% 
+  mutate(night_surgery = ifelse(S02TimeOfSurgeryStartIncision == 20 | S02TimeOfSurgeryStartIncision == 0 | S02TimeOfSurgeryStartIncision == 4, 1, 0))
+
+# Create night surgery variable
+patients_clean <- patients_clean %>% 
+  mutate(weekend.factor = factor(weekend)) %>% 
+  mutate(night_surgery.factor = factor(night_surgery))
+
+# create variables for abnormal vs normal blood tests 
+
+patients_clean <- patients_clean %>% 
+  mutate(abnormal_creatinine = ifelse(S03Creatinine > 110 & S01Gender == "M" |
+                                      S03Creatinine > 90 & S01Gender == "F" |
+                                      S03Creatinine < 60 & S01Gender == "M" |
+                                      S03Creatinine < 45 & S01Gender == "F",  1, 0)) %>% 
+  mutate(abnormal_urea = ifelse(S03Urea > 7.8 |
+                                      S03Urea < 2.5,  1, 0)) %>%
+  mutate(abnormal_hb = ifelse(S03Hb > 180 & S01Gender == "M" |
+                                      S03Hb > 165 & S01Gender == "F" |
+                                      S03Hb < 130 & S01Gender == "M" |
+                                      S03Hb < 115 & S01Gender == "F",  1, 0)) %>% 
+  mutate(abnormal_sodium = ifelse(S03Na > 145 |
+                                      S03Na < 135,  1, 0)) %>%
+  mutate(abnormal_potassium = ifelse(S03K > 5 |
+                                      S03K < 3.5,  1, 0)) %>%
+  mutate(abnormal_wcc = ifelse(S03WhiteCellCountWcc > 11 |
+                                      S03WhiteCellCountWcc < 3.6,  1, 0)) %>%
+  mutate(abnormal_hba1c = ifelse(S03HBA1c > 42,  1, 0)) 
+
+# Create variable "abnormal blood test" that returns a "1" if the patient has an abnormality of any of the pre-op blood tests                                        
+patients_clean <- patients_clean %>% 
+  mutate(abnormal_bloodtest = ifelse(abnormal_creatinine == 1 |
+                                     abnormal_urea == 1 |
+                                     abnormal_hb == 1 |
+                                     abnormal_sodium == 1 |
+                                     abnormal_potassium == 1 |
+                                     abnormal_wcc == 1, 1, 0)) %>% #hba1c not included due to low patient numbers who it was tested in (>90% missing)
+# Create variable "abnormal biochemistry" that returns a "1" if the patient has an abnormality of any of the pre-op blood tests looking at biochemistry    
+  mutate(abnormal_biochemistry = ifelse(abnormal_creatinine == 1 |
+                                     abnormal_urea == 1 |
+                                     abnormal_sodium == 1 |
+                                     abnormal_potassium == 1, 1, 0)) %>% 
+# Create variable "abnormal renal function" that returns a "1" if the patient has an abnormality of any of the pre-op blood tests looking at renal function 
+  mutate(abnormal_renalfunction = ifelse(abnormal_creatinine == 1 |
+                                     abnormal_urea == 1, 1, 0))
+
+# create new variables for categorising blood test results into low/normal/high
+
+patients_clean <- patients_clean %>% mutate(creatinine_category = ifelse(S03Creatinine > 110 & S01Gender == "M" |
+                                      S03Creatinine > 90 & S01Gender == "F", "High",
+                                      ifelse(S03Creatinine < 60 & S01Gender == "M" |
+                                      S03Creatinine < 45 & S01Gender == "F", "Low", "Normal"))) %>% 
+  mutate(urea_category = ifelse(S03Urea > 7.8, "High",
+                                      ifelse(S03Urea < 2.5,  "Low", "Normal"))) %>%
+  mutate(hb_category = ifelse(S03Hb > 180 & S01Gender == "M" |
+                                      S03Hb > 165 & S01Gender == "F", "High",
+                                      ifelse(S03Hb < 130 & S01Gender == "M" |
+                                      S03Hb < 115 & S01Gender == "F",  "Low", "Normal"))) %>% 
+  mutate(sodium_category = ifelse(S03Na > 145, "High",
+                                      ifelse(S03Na < 135,  "Low", "Normal"))) %>%
+  mutate(potassium_category = ifelse(S03K > 5, "High",
+                                      ifelse(S03K < 3.5,  "Low", "Normal"))) %>%
+  mutate(wcc_category = ifelse(S03WhiteCellCountWcc > 11, "High",
+                                      ifelse(S03WhiteCellCountWcc < 3.6,  "Low", "Normal"))) %>%
+  mutate(hba1c_category = ifelse(S03HBA1c > 42, "High", "Normal"))
+
+# create new variables that are factor versions of the above
+patients_clean <- patients_clean %>% 
+  mutate(creatinine_category.factor = factor(creatinine_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+   mutate(urea_category.factor = factor(urea_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+   mutate(hb_category.factor = factor(hb_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+   mutate(sodium_category.factor = factor(sodium_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+   mutate(potassium_category.factor = factor(potassium_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+   mutate(wcc_category.factor = factor(wcc_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+   mutate(hba1c_category.factor = factor(hba1c_category) %>% 
+           fct_relevel("Normal", "High")) 
+
+patients_clean <- patients_clean %>% 
+  mutate(abnormal_bloodtest.factor = as.factor(abnormal_bloodtest))
+
+# recode the pre-assessment variable to reflect the fact that NA usually refers to the fact that a pre-assessment was not required for this type of surgery, rather than being true missing data
+patients_clean <- patients_clean %>% 
+  mutate(pre_assessment_include_na = fct_explicit_na(S02PreoperativeAssessmentBeforeHospitalAdmission) %>% 
+          fct_recode(
+    "N" = "N",
+    "Y" = "Y",
+    "Not applicable" = "(Missing)"
+         ))
+
+# recode gender as a factor
+patients_clean$S01Gender <- as.factor( patients_clean$S01Gender)
+# recode hospital site as a factor
+patients_clean$SiteCode <- as.factor( patients_clean$SiteCode)
+# recode age as a number
+ patients_clean$age <- as.integer( patients_clean$S01Age)
+# create age category with 20 year bins
+ patients_clean$age_p20 <- as.ordered(cut2(patients_clean$age, g=5))
+# create age category with 10 year bins 
+  patients_clean$age_p10 <- as.ordered(cut(patients_clean$age, breaks = c(18,30, 40,50,60,70,80, 105), include.lowest = TRUE) %>% 
+      fct_recode(
+        "18 to 30"      =  "[18,30]",
+        "31 to 40" = "(30,40]",
+        "41 to 50" = "(40,50]",
+        "51 to 60"      = "(50,60]", 
+        "61 to 70" = "(60,70]",
+        "71 to 80" = "(70,80]",
+        "80+"      = "(80,105]")
+  )
+
+# recode pre-op length of stay as a factor and categorise   
+patients_clean <- patients_clean %>% 
+  mutate(
+    PreopLOS.factor = 
+      S02PreopLOS %>%
+      cut(breaks = c(0,1,2,7,21,251), include.lowest = TRUE, right = FALSE) %>% 
+      fct_recode(
+        "0" = "[0,1)",
+        "1" = "[1,2)",
+        "2 to 6" = "[2,7)",
+        "7 to 20" = "[7,21)",
+        "21 to 251" = "[21,251]"
+      ))
+   
+ # recode pre-op level of support as a factor
+ patients_clean$S02LevelOfSupport <- as.factor( patients_clean$S02LevelOfSupport)
+
+ # recode patient origin as a factor
+ patients_clean$S02PatientOrigin <- as.factor( patients_clean$S02PatientOrigin)
+
+ # recode operation urgency as a factor
+ patients_clean$S02OperativeUrgency <- as.factor( patients_clean$S02OperativeUrgency)
+ # revel the above as Urgency: should be elective -> expedited -> urgent -> immediate
+patients_clean <- patients_clean %>% 
+  mutate(S02OperativeUrgency = S02OperativeUrgency %>%
+  fct_relevel("Ele", "Exp", "U", "I")) 
+ 
+# recode ASA as a factor
+ patients_clean$S03AsaPsClass <- as.factor( patients_clean$S03AsaPsClass)
+ 
+# combine ASA IV with V, as very few patients with V 
+  patients_clean <-  patients_clean %>% 
+  mutate(asa = fct_collapse(
+    S03AsaPsClass,
+    "IV" = c("IV", "V")) %>% 
+  fct_recode(
+    "I" = "I",
+    "II" = "II",
+    "III" = "III",
+    "IV/V" = "IV"
+  ))
+ 
+# recode PMHx CAD as a factor
+ patients_clean$S03PastMedicalHistoryCoronaryArteryDisease <- as.factor( patients_clean$S03PastMedicalHistoryCoronaryArteryDisease)
+ # recode PMHx CCF as a factor
+ patients_clean$S03PastMedicalHistoryCongestiveCardiacFailure <- as.factor( patients_clean$S03PastMedicalHistoryCongestiveCardiacFailure)
+ # recode PMHx Stroke/TIA as a factor
+ patients_clean$S03PastMedicalHistoryStrokeTIA <- as.factor( patients_clean$S03PastMedicalHistoryStrokeTIA)
+# recode PMHx dementia as a factor 
+ patients_clean$S03PastMedicalHistoryDementia <- as.factor( patients_clean$S03PastMedicalHistoryDementia)
+# recode PMHx COPD as a factor
+ patients_clean$S03PastMedicalHistoryCOPD <- as.factor( patients_clean$S03PastMedicalHistoryCOPD)
+# recode PMHx Pul fibrosis as a factor
+ patients_clean$S03PastMedicalHistoryPulmonaryFibrosis <- as.factor( patients_clean$S03PastMedicalHistoryPulmonaryFibrosis)
+# recode PMHx Cirrhosis as a factor
+ patients_clean$S03PastMedicalHistoryLiverCirrhosis <- as.factor( patients_clean$S03PastMedicalHistoryLiverCirrhosis)
+# recode PMHx renal disease as a factor
+ patients_clean$S03PastMedicalHistoryRenalDisease <- as.factor( patients_clean$S03PastMedicalHistoryRenalDisease)
+# recode PMHx Complex polytrauma as a factor
+ patients_clean$S03PastMedicalHistoryComplexPolytrauma <- as.factor( patients_clean$S03PastMedicalHistoryComplexPolytrauma)
+# recode PMHx Cancer last 5 years as a factor  
+ patients_clean$S03PastMedicalHistoryCancerLast5Yrs <- as.factor( patients_clean$S03PastMedicalHistoryCancerLast5Yrs)
+# recode PMHx Current metastatic cancer as a factor  
+ patients_clean$S03PastMedicalHistoryMetastaticCancerCurrent <- as.factor( patients_clean$S03PastMedicalHistoryMetastaticCancerCurrent)
+
+# recode PMHx diabetes as a factor and relevel it for increasing severity based on insulin need
+ patients_clean <-  patients_clean %>% 
+  mutate(diabetes.factor = factor(S03Diabetes) %>% 
+           fct_relevel("N", "2D", "2O", "2I", "1"))
+
+ # create variable that categorised pre-op GCS level
+patients_clean <- patients_clean %>% 
+  mutate(GCS_category = ifelse(S03GlasgowComaScaleGcsPreInductionOfAnaesthesia <= 8, "8 or less", 
+                               ifelse(S03GlasgowComaScaleGcsPreInductionOfAnaesthesia %in% c(9, 10, 11), "9-11",
+                                      ifelse(S03GlasgowComaScaleGcsPreInductionOfAnaesthesia %in% c(12, 13, 14), "12-14", "15")))) %>% 
+  mutate(GCS_category.factor = factor(GCS_category) %>% 
+           fct_relevel("8 or less", "9-11", "12-14", "15"))
+
+# recode grade of anaesthetist as a factor 
+patients_clean$S03GradeOfMostSeniorAnaesthetistPresent <- as.factor( patients_clean$S03GradeOfMostSeniorAnaesthetistPresent)
+
+# recode grade of surgeon as a factor 
+patients_clean$S03GradeOfMostSeniorSurgeonPresent <- as.factor( patients_clean$S03GradeOfMostSeniorSurgeonPresent)
+
+# recode Blood loss as a factor and then recode it to reflect the categories in the CRF
+patients_clean$S04BloodLoss <- as.factor(patients_clean$S04BloodLoss) 
+patients_clean$S04BloodLoss <- fct_recode(patients_clean$S04BloodLoss, "0-100ml" =  "0", "101-500ml" = "101", "501-999ml" = "501",">1000ml"  = "1000")
+
+# recode combined_PMHx as a factor
+patients_clean$combined_PMHx <- as.factor(patients_clean$combined_PMHx) 
+# recode combined_DHx as a factor
+patients_clean$combined_DHx <- as.factor( patients_clean$combined_DHx)
+# recode PMHx_query_other as a factor
+patients_clean$PMHx_query_other <- as.factor( patients_clean$PMHx_query_other)
+# recode PMHx_combined_and_query_other as a factor
+patients_clean$PMHx_combined_and_query_other <- as.factor( patients_clean$PMHx_combined_and_query_other)
+
+# recode some other variables as factors
+patients_clean  <- patients_clean %>% 
+  mutate(EmptyBedsTimeofSurgCat = factor(EmptyBedsTimeofSurgCat)) %>% 
+  mutate(S04CriticalUnexpectedEventsPerioperatively = factor(S04CriticalUnexpectedEventsPerioperatively),
+         combined_radiology_findings = factor(combined_radiology_findings),
+         S04AnaestheticTechniqueGeneral = factor(S04AnaestheticTechniqueGeneral))
+
+# Transform POSSUM/SORT/SRS scores into probabilities from the current log-odds form
+
+patients_clean$POSSUM_morb <- arm::invlogit(patients_clean$POSSUM_morb)
+patients_clean$pPOSSUM_mort <- arm::invlogit(patients_clean$pPOSSUM_mort)
+patients_clean$SORT_morb <- arm::invlogit(patients_clean$SORT_morb)
+patients_clean$SORT_mort <- arm::invlogit(patients_clean$SORT_mort)
+patients_clean$SRS_mort <- arm::invlogit(patients_clean$SRS_mort)
+
+# Categorise SORT score for better interpretability
+patients_clean$SORT_mort_perc <- patients_clean$SORT_mort * 100
+patients_clean$SORT_mort_perc_cat <- patients_clean$SORT_mort_perc %>%
+  as.numeric() %>% 
+  cut(breaks = c(0,1,5,10,87), include.lowest = TRUE) %>% 
+  factor() %>% 
+      fct_recode(
+        "0 to 1"      =  "[0,1]",
+        "1 to 5" = "(1,5]",
+        "5 to 10" = "(5,10]",
+        ">10"      = "(10,87]")
+
+# categorise doctor grade into consultant vs non-consultant, scale and centre age/hr/bp then ensure they are numeric
+patients_clean <- patients_clean %>% 
+  mutate(
+    Anaesthetist_grade_combined.factor = fct_collapse(
+      S03GradeOfMostSeniorAnaesthetistPresent, 
+      "Non-consultant" = c("AS", "CFT", "FEL", "JR", "SR", "ST3")) %>% 
+      fct_relevel("Con", "Non-consultant")
+  ) %>% 
+  mutate(
+    Surgeon_grade_combined.factor = fct_collapse(
+      S03GradeOfMostSeniorSurgeonPresent, 
+      "Non-consultant" = c("AS", "CFT", "FEL", "JR", "SR", "ST3")) %>% 
+      fct_relevel("Con", "Non-consultant")
+  ) %>% 
+  mutate(Age_scaled = scale(patients_clean$S01Age, center = TRUE, scale = TRUE)) %>%  #this function centers by subtracting the overall mean and scales by dividing by the standard deviation
+  mutate(sysBP_scaled = scale(patients_clean$S03SystolicBloodPressureBpAtPreAssessment, center = TRUE, scale = TRUE)) %>% 
+  mutate(HR_scaled = scale(patients_clean$S03PulseRateAtPreoperativeAssessment, center = TRUE, scale = TRUE)) %>% 
+   mutate(Age_scaled = as.numeric(Age_scaled),
+         sysBP_scaled = as.numeric(sysBP_scaled),
+         HR_scaled = as.numeric(HR_scaled)
+         ) 
+
+# make CCU time of surgery into category and factor the surgical specialty
+patients_clean <- patients_clean %>% 
+mutate(CCUCapacityTimeofSurgCat = ifelse(CCUCapacityTimeofSurgery == 0, 
+                                         "0",
+                                         ifelse(CCUCapacityTimeofSurgery == 1, 
+                                                "1",
+                                                ifelse(CCUCapacityTimeofSurgery > 1, 
+                                                       "2 or more", NA))))
+
+patients_clean <- patients_clean %>% 
+  mutate(specialty.factor = as.factor(Specialty))
+
+```
+
+
+# Re-label data 
+```{r}
+library(labelled)
+
+# change the value labels of certain variables so they make more sense in graphs/tables/etc. 
+patients_clean$S02PatientOrigin <- fct_recode(patients_clean$S02PatientOrigin, "Home" =  "H", "Inpatient" = "I")
+
+patients_clean$S01Gender <- fct_recode(patients_clean$S01Gender, "Female" =  "F", "Male" = "M")  
+
+patients_clean$weekend.factor <- fct_recode(patients_clean$weekend.factor, "Weekday" =  "0", "Weekend" = "1")
+
+patients_clean$S02OperativeUrgency <- fct_recode(patients_clean$S02OperativeUrgency, "Elective" =  "Ele", "Expedited" = "Exp", "Urgent" = "U", "Immediate" = "I")
+
+patients_clean$S02PlannedProcSeverity <- fct_recode(patients_clean$S02PlannedProcSeverity, "Minimal" =  "Min", "Intermediate" = "Int", "Major" =  "Maj", "XMajor" = "Xma", "Complex" = "Com")
+
+patients_clean$S02LevelOfSupport <- droplevels(patients_clean$S02LevelOfSupport)
+
+patients_clean$combined_radiology_findings <- fct_relevel(patients_clean$combined_radiology_findings, "CXR not done", "Normal", "Consolidation", "Cardiomegaly", "Other abnormality")
+
+patients_clean$combined_DHx <- fct_recode(patients_clean$combined_DHx, "False" =  "0", "True" = "1")
+
+patients_clean$combined_PMHx <- fct_recode(patients_clean$combined_PMHx, "False" =  "0", "True" = "1")
+
+patients_clean$S04AnaestheticTechniqueGeneral <- fct_recode(patients_clean$S04AnaestheticTechniqueGeneral, "False" =  "FALSE", "True" = "TRUE")
+
+patients_clean$diabetes.factor <- fct_recode(patients_clean$diabetes.factor, "None" =  "N", "T2DM - Diet Controlled" = "2D", "T2DM - Oral medication" =  "2O", "T2DM - Insulin controlled" = "2I", "T1DM" = "1")
+
+patients_clean$night_surgery.factor <- fct_recode(patients_clean$night_surgery.factor, "Day" =  "0", "Night" = "1")
+
+patients_clean$pre_assessment_include_na <- fct_recode(patients_clean$pre_assessment_include_na, "No" =  "N", "Yes" = "Y", "Not applicable" = "Not applicable")
+
+patients_clean$Anaesthetist_grade_combined.factor <- fct_recode(patients_clean$Anaesthetist_grade_combined.factor, "Consultant" =  "Con", "Non-consultant" = "Non-consultant")
+
+patients_clean$Surgeon_grade_combined.factor <- fct_recode(patients_clean$Surgeon_grade_combined.factor, "Consultant" =  "Con", "Non-consultant" = "Non-consultant")
+
+patients_clean$S04CriticalUnexpectedEventsPerioperatively <- fct_recode(patients_clean$S04CriticalUnexpectedEventsPerioperatively, "False" =  "N", "True" = "Y")
+
+patients_clean$POMS.factor <- fct_recode(patients_clean$POMS.factor, "False" =  "FALSE", "True" = "TRUE")
+
+patients_clean$mortality30.factor <- fct_recode(patients_clean$mortality30.factor, "False" =  "FALSE", "True" = "TRUE")
+
+patients_clean$mortality60.factor <- fct_recode(patients_clean$mortality60.factor, "False" =  "FALSE", "True" = "TRUE")
+
+patients_clean$icu_adm.factor <- fct_recode(patients_clean$icu_adm.factor, "Ward" =  "FALSE", "Critical Care" = "TRUE")
+
+patients_clean$abnormal_bloodtest.factor <- fct_recode(patients_clean$abnormal_bloodtest.factor, "False" =  "0", "True" = "1")
+
+# change variable labels for table
+var_label(patients_clean) <- list(country = "Country",
+          S01Gender = "Sex",
+          S01Age = "Age", 
+         S02PatientOrigin = "Patient Origin" ,
+         weekend.factor = "Day of surgery" ,
+          procedure_count.factor = "Procedures performed in previous 30 days (including current surgery)",
+          S02OperativeUrgency = "Operative Urgency",
+         S02PlannedProcSeverity = "Procedure Severity",
+         asa = "ASA grade" ,
+         SORT_mort_perc_cat = "SORT Mortality estimate category (%)",
+         S04AnaestheticTechniqueGeneral = "General Anaesthetic" ,
+         S02LevelOfSupport = "Pre-operative level of support",
+         PreopLOS.factor = "Pre-operative length of stay (days)",
+         combined_radiology_findings = "Pre-operative Chest X-Ray findings" ,
+         combined_DHx = "Positive drug history for listed medications" ,
+         combined_PMHx = "Positive past medical history of listed conditions" ,
+         diabetes.factor = "Diabetes" ,
+          GCS_category.factor = "Glasgow Coma Scale pre-induction of anaesthesia",
+         S03SystolicBloodPressureBpAtPreAssessment = "Pre-anaesthetic induction systolic blood pressure",
+          S03PulseRateAtPreoperativeAssessment = "Pre-anaesthetic induction pulse rate",
+         dyspnoea.factor = "Level of dyspnoea pre-operatively" ,
+          night_surgery.factor = "Time of surgery",
+          Anaesthetist_grade_combined.factor = "Grade of most senior Anaesthetist",
+          Surgeon_grade_combined.factor = "Grade of most senior Surgeon",
+         pre_assessment_include_na = "Pre-operative assessment before hospital admission" ,
+          creatinine_category.factor = "Pre-operative creatinine" ,
+          urea_category.factor = "Pre-operative urea",
+          hb_category.factor = "Pre-operative haemoglobin",
+          sodium_category.factor = "Pre-operative sodium",
+          potassium_category.factor = "Pre-operative potassium" ,
+          wcc_category.factor = "Pre-operative white cell count",
+          S04CriticalUnexpectedEventsPerioperatively = "Critical/Unexpected events perioperatively" ,
+          S04BloodLoss = "Estimated total blood loss",
+         POMS.factor = "POMS day 7" ,
+         S07PostopLOS = "Post-operative length of stay" ,
+          mortality30.factor = "30 day mortality" ,
+          mortality60.factor = "60 day mortality",
+         CCUCapacityTimeofSurgCat = "Critical Care Unit available beds",
+         icu_adm.factor = "Post-operative destination",
+         abnormal_bloodtest.factor = "Abnormality on pre-operative blood test",
+         age_p10 = "Age category",
+         EmptyBedsTimeofSurgCat = "Empty CCU beds at time of surgery",
+         CCUCapacityTimeofSurgery = "Available CCU beds at time of surgery (Empty + Discharge-ready beds)",
+         specialty.factor = "Surgical specialty")
+
+```
+
+# Rename recoded/cleaned dataset and save
+```{r}
+patients_labelled <- patients_clean
+
+save(patients_labelled, file = 'patients_labelled.rda')
+```
+
+
+# Apply eligbility criteria {.tabset}
+
+# Next we shall start to apply some inclusion/exclusion criteria. 
+
+## First surgery
+
+Include only **first surgery** during stay and store in patients_labelled2.
+
+```{r}
+tally_of_surgical_procedures <- patients_labelled %>% group_by(HashValue) %>% tally() # HashValue = pseudo-anonymised patent ID
+  #24419 patients had 1 operation, 290 had 2, 14 had 3, 1 had 98, NA was 1363
+
+  #The 98x record patient appears to be multiple patients. It is likely that this represents instances where patients did not possess an NHS number and the data entry tool defaulted to a 00000000 NHS number, which turned into the same HashValue after pseudo-anonymisation).
+
+  #N/A was 1363. 1015 of these are patients from NZ, 348 from UK, 0 from Aus. 
+
+ #Although it is possible to exclude all these patients (on the basis is is impossible to fully identify them as different patients for the same HashValue), it would be a big waste of data to exclude them all (including removing an entire country). 
+
+#Therefore, these patients are ordered based on day and then time of surgery so they are in-order. I then searched and removed duplicates based on: country, gender, age. 
+patients_labelled$S02StudyDay <- factor(patients_labelled$S02StudyDay, 
+                                     levels = c("Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Mon"), 
+                                     ordered = TRUE)
+
+duplicates <- patients_labelled %>%   
+  arrange(S02StudyDay, S02TimeOfSurgeryStartIncision) %>%  #order by time (ascending)
+  dplyr::select(HashValue, country, CaseId, SiteCode, S01Gender, S01Age, S02StudyDay, S02TimeOfSurgeryStartIncision) %>% 
+  filter(HashValue == '8104ba1dc0409b259f487ed07db477c3' | is.na(HashValue)) %>% 
+  group_by(HashValue) %>% 
+  filter(duplicated(cbind(country, S01Gender, S01Age))) %>% 
+  dplyr::select(CaseId) %>%
+  pull()#To make a tbl into a vector
+
+#this identified 1114 potential duplicated rows. I exclude the duplicates, but retain the 1st value of each as this would represent their first surgery)
+
+duplicates_HashValue <- patients_labelled %>% group_by(HashValue) %>% filter(HashValue == '8104ba1dc0409b259f487ed07db477c3') %>%  filter(duplicated(cbind(country, S01Gender, S01Age)))
+
+duplicates_na_HashValue <- patients_labelled %>% group_by(HashValue) %>% filter(is.na(HashValue)) %>%  filter(duplicated(cbind(country, S01Gender, S01Age)))
+#This created a list of the removed potential duplicates from the repeated HashValue (n=33) and from NA (n=1081)
+
+#now I shall remove the 2nd/3rd operations for patients with the same HashValue
+to_remove <- patients_labelled %>% group_by(HashValue) %>% tally() %>% 
+   filter(n > 1) %>% #306 repeated HashValues identified 
+  pull(HashValue)  
+
+
+to_remove <- patients_labelled %>% filter(HashValue %in% to_remove) %>%  
+  filter(!(is.na(HashValue) | HashValue == "8104ba1dc0409b259f487ed07db477c3")) %>% 
+  group_by(HashValue) %>% 
+  arrange(S02StudyDay, S02TimeOfSurgeryStartIncision) %>%  #order by time (ascending)
+  dplyr::select(HashValue, CaseId, SiteCode, S01Gender, S01Age, S02StudyDay, S02TimeOfSurgeryStartIncision) %>%
+  slice(2:3) %>%  #Take the 2nd and 3rd observations of each group (by HashValue)
+  dplyr::select(CaseId) %>%
+  pull() #318 CaseIds to remove (290 for patients with 2 surgeries, then 14x2 for patients with 3 surgeries)
+
+patients_labelled2 <- patients_labelled %>% filter(!(CaseId %in% to_remove)) %>% #318 cases of repeated surgery removed
+   filter(!(CaseId %in% duplicates)) #1114 "duplicated" cases removed where HashValue was missing or erroneous 
+
+```
+
+
+## Pre-op high acuity
+
+Exclude **level 2 and 3** (high acuity ward) prior to surgery and store in patients_labelled3.
+
+```{r}
+patients_labelled3 <- patients_labelled2 %>% 
+  filter(!(S02LevelOfSupport %in% c("2", "3")))
+```
+
+## Complex procedures
+
+Exclude procedures with **absolute ICU indication** (e.g. thoracic surgery, neuro-surgery) and store in patients_labelled4.
+
+```{r}
+
+patients_labelled4 <- patients_labelled3 %>% 
+  filter(!(S02PlannedProcedureMainGroup == "6" & S02PlannedProcedureSubGroup %in% c("8", "9", "10"))) %>% 
+  # 6.8 = (Vascular, Great Vessel surgery) 6.9 = (Thoracic, Other [incl. heart transplant]), 6.9 = (Thoracic, Heart-cardiac surgery)
+  filter(!(S02PlannedProcedure %in% c("6-5-14-Com", "6-5-15-Com", "6-5-8-Com", "6-5-20-Com", "6-5-22-Com"))) %>%
+  # 6-5-14-Com = Pneumonectomy, 6-5-15-Com = Pulmonary lobectomy including segmental resection, 6-5-8-Com = Lung resection with resection of chest wall, 6-5-20-Com = Thoracotomy lung volume reduction - unilateral, 6-5-22-Com = Thoractomy lung volume reduction - bilateral
+  filter(!(S02PlannedProcedureMainGroup == "7" & S02PlannedProcedureSubGroup %in% c("2", "4"))) %>%
+  # 7.2 = (Vascular, Thoracic Vessels), 7.4 = (Vascular, Abdominal vessels)
+  filter(!(S02PlannedProcedure %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com"))) %>%
+  # 9-6-45-Com = Liver transplant, 9-6-46-Com = Liver and Kidney transplant, 9-6-47-Com = Bowel Transplant
+  filter(!(S02PlannedProcedureMainGroup == "14") | is.na(S02PlannedProcedureMainGroup)) # 14 = Neurosurgery
+
+#create list of excluded procedures
+excluded_procedures_clean <- SNAP2_procedurelist_specialty_coded %>% 
+  filter(
+  (SurgeryProcedureMainGroupId == "6" & SurgeryProcedureSubGroupId %in% c("8", "9", "10")) | 
+  (Code %in% c("6-5-14-Com", "6-5-15-Com", "6-5-8-Com", "6-5-20-Com", "6-5-22-Com")) |
+  (SurgeryProcedureMainGroupId == "7" & SurgeryProcedureSubGroupId %in% c("2", "4")) |
+  (Code %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com")) |
+  (SurgeryProcedureMainGroupId == "14")) %>% 
+  dplyr::select(Code, SurgeryProcedure, SurgeryProcedureSeverity, Specialty)
+  
+#create list of cases excluded due to surgical procedure + tally to identify most commonly excluded procedure
+excluded_procedures_clean_patient_list <- patients_labelled3 %>% 
+  left_join(SNAP2_procedurelist_specialty_coded, by = c("S02PlannedProcedure" = "Code")) %>% 
+  filter(
+  (S02PlannedProcedureMainGroup == "6" & S02PlannedProcedureSubGroup %in% c("8", "9", "10")) | 
+  (S02PlannedProcedure %in% c("6-5-14-Com", "6-5-15-Com", "6-5-8-Com", "6-5-20-Com", "6-5-22-Com")) |
+  (S02PlannedProcedureMainGroup == "7" & S02PlannedProcedureSubGroup %in% c("2", "4")) |
+  (S02PlannedProcedure %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com")) |
+  (S02PlannedProcedureMainGroup == "14")) %>% 
+  dplyr::select(CaseId, SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y) #453 patients
+  
+excluded_procedures_clean_tally <- excluded_procedures_clean_patient_list %>% 
+  dplyr::select(SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y) %>% 
+  group_by(SurgeryProcedure) %>% 
+  tally() %>% 
+  arrange(desc(n))
+
+#I note no cardiac surgery like AA repair is included in the list of excluded procedures as no patients underwent this procedure in the study week. 
+
+```
+
+## Low-risk procedures
+
+Exclude procedures with a **very low chance** of admission to CCU (i.e. routine Obstetrics). Store in patients_labelled5. 
+```{r, eval=FALSE}
+#identify if any obs patients were admitted to ICU post-op 
+number_patients_adm_icu_Obs <- patients_labelled4 %>% 
+  filter(S02PlannedProcedureMainGroup == "15") 
+
+table(number_patients_adm_icu_Obs$icu_adm) #52 patients admitted, 3276 not admitted (1.6%)
+
+#exclude obs patients
+patients_labelled5 <- patients_labelled4 %>% 
+  filter(!(S02PlannedProcedureMainGroup == "15") | is.na(S02PlannedProcedureMainGroup))
+
+#add to list of excluded procedures
+excluded_procedures_clean <- SNAP2_procedurelist_specialty_coded %>% 
+  filter(
+  (SurgeryProcedureMainGroupId == "6" & SurgeryProcedureSubGroupId %in% c("8", "9", "10")) | 
+  (Code %in% c("6-5-14-Com", "6-5-15-Com", "6-5-8-Com", "6-5-20-Com", "6-5-22-Com")) |
+  (SurgeryProcedureMainGroupId == "7" & SurgeryProcedureSubGroupId %in% c("2", "4")) |
+  (Code %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com")) |
+  (SurgeryProcedureMainGroupId == "14") |
+  (SurgeryProcedureMainGroupId == "15")   
+  ) %>% 
+  dplyr::select(Code, SurgeryProcedure, SurgeryProcedureSeverity, Specialty)
+  
+#add to list of cases excluded due to surgical procedure + tally to identify most commonly excluded procedure
+excluded_procedures_clean_patient_list <- patients_labelled3 %>% 
+  left_join(SNAP2_procedurelist_specialty_coded, by = c("S02PlannedProcedure" = "Code")) %>% 
+  filter(
+  (S02PlannedProcedureMainGroup == "6" & S02PlannedProcedureSubGroup %in% c("8", "9", "10")) | 
+  (S02PlannedProcedure %in% c("6-5-14-Com", "6-5-15-Com", "6-5-8-Com", "6-5-20-Com", "6-5-22-Com")) |
+  (S02PlannedProcedureMainGroup == "7" & S02PlannedProcedureSubGroup %in% c("2", "4")) |
+  (S02PlannedProcedure %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com")) |
+  (S02PlannedProcedureMainGroup == "14")  |
+  (SurgeryProcedureMainGroupId == "15")
+  ) %>% 
+  dplyr::select(CaseId, SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y) #453 patients
+  
+excluded_procedures_clean_tally <- excluded_procedures_clean_patient_list %>% 
+  dplyr::select(SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y) %>% 
+  group_by(SurgeryProcedure) %>% 
+  tally() %>% 
+  arrange(desc(n))
+
+save(excluded_procedures_clean_patient_list, file='excluded_procedures_clean_patient_list.rda')
+save(excluded_procedures_clean_tally, file='excluded_procedures_clean_tally.rda')
+
+```
+
+
+## Site occupancy data
+
+Drop **whole site** when the site has >20% cases with missing occupancy data at time of surgery out of all cases from this site.
+
+```{r}
+site_mis <- patients_labelled5 %>% filter(is.na(CCUCapacityTimeofSurgery)) %>% group_by(SiteCode)  %>% summarise(mis=n()) #count missing cases per site
+site_all <- patients_labelled5 %>% group_by(SiteCode)  %>% summarise(all=n()) #count number of total cases per site
+
+
+#Total number of cases per site and number of cases with missing occupancy data per site
+
+site_drop <- left_join(site_all, site_mis, by = "SiteCode")
+site_drop$ratio_bed <- site_drop$mis / site_drop$all #build ratio out of missing cases per site / total cases per site
+site_drop <- site_drop %>% arrange(desc(ratio_bed))
+
+
+#Ratio (cases with missing occupancy data / total cases per site) >20%
+
+site_drop20 <- site_drop %>% filter(ratio_bed >= 0.2)
+knitr::kable(site_drop20, format = "markdown")
+
+
+#Drop whole site when site has >20% missing cases
+
+patients_labelled6 <- left_join(patients_labelled5, site_drop, by="SiteCode") #join with main dataset. 
+patients_labelled6 <- patients_labelled6 %>% filter(ratio_bed < 0.2 | is.na(ratio_bed)) #keep all cases with NA in ratio_bed or ratio_bed < 0.2
+```
+
+## We have now created a dataset of the population of interest. We have not yet excluded patients based on missing values of variables of interest (e.g. we may want to exclude all patients with missing morbidity data for the final analysis) as we want to examine the "missingness of the data" before we do this. 
+```{r}
+save(patients_labelled6, file='patients_labelled6.rda')
+```
+
+# Investigate target population {.tabset}
+Repeat the summary statistics on this dataset to understand it better before continuing with analysis. 
+```{r}
+patients_labelled6 %>% ff_glimpse() #view summary characteristics for each variable (NB does not work for logical type variables)
+```
+
+## Study flow diagram (prior to removing patients with missing values for variables of interest) {.tabset}
+
+```{r}
+data <- list(a= nrow(patients_labelled), b= nrow(patients_labelled2), c= nrow(patients_labelled3),
+             d= nrow(patients_labelled4), e= nrow(patients_labelled5), f= nrow(patients_labelled6))
+
+library(DiagrammeR)
+DiagrammeR::grViz("
+digraph graph2 {
+
+graph [layout = dot]
+
+node [shape = rectangle, width = 4, fillcolor = Linen]
+a [label = '@@1']
+b [label = '@@2']
+c [label = '@@3']
+d [label = '@@4']
+e [label = '@@5']
+f [label = '@@6']
+
+a -> b -> c -> d -> e -> f
+
+}
+
+[1]:  paste0('Starting cohort (n = ', data$a, ')')
+[2]: paste0('Include only first surgery during hospital stay (n = ', data$b, ')')
+[3]: paste0('Exclude stay in high acuity ward prior to surgery (n = ', data$c, ')')
+[4]: paste0('Exclude procedures with absolute ICU indication (n = ', data$d, ')')
+[5]: paste0('Exclude Obstetric procedures (as very low risk) (n = ', data$e, ')')
+[6]: paste0('Exclude sites with >20% missing occupancy data (n = ', data$f, ')')  
+")
+```
+
+# Create publication baseline charactersitics tables of icu_adm vs ward (non-imputed data)
+```{r}
+# Create baseline characteristics table
+dependent_icu_adm = "icu_adm.factor"
+
+explanatory_icu_adm = c("EmptyBedsTimeofSurgCat",
+         "CCUCapacityTimeofSurgery",
+         "country",
+          "S01Gender" ,
+          "S01Age" , 
+          "asa"  ,
+          "SORT_mort_perc_cat" ,
+          "combined_DHx"  ,
+         "combined_PMHx" ,
+         "diabetes.factor" ,
+         "creatinine_category.factor" ,
+          "urea_category.factor",
+          "hb_category.factor" ,
+          "sodium_category.factor" ,
+          "potassium_category.factor"  ,
+          "wcc_category.factor" ,
+         "S02PatientOrigin" ,
+         "PreopLOS.factor",
+         "S03SystolicBloodPressureBpAtPreAssessment" ,
+          "S03PulseRateAtPreoperativeAssessment" ,
+          "S02OperativeUrgency" ,
+         "S02PlannedProcSeverity" ,
+         "weekend.factor" ,
+         "night_surgery.factor"  ,
+          "Anaesthetist_grade_combined.factor"  ,
+          "Surgeon_grade_combined.factor"  ,
+         "specialty.factor",
+          "S04BloodLoss" ,
+         "POMS.factor"  ,
+         "S07PostopLOS"  ,
+          "mortality30.factor"  ,
+          "mortality60.factor")
+
+explanatory_icu_adm_concise = c("CCUCapacityTimeofSurgery",
+          "country",
+          "S01Gender" ,
+          "S01Age" , 
+          "asa"  ,
+          "SORT_mort_perc_cat" ,
+          "combined_DHx"  ,
+         "combined_PMHx" ,
+         "abnormal_bloodtest.factor",
+          "S02OperativeUrgency" ,
+         "S02PlannedProcSeverity" ,
+          "S04BloodLoss" ,
+         "POMS.factor"  ,
+         "S07PostopLOS"  ,
+          "mortality30.factor")
+
+icu_adm_characteristics_table_chosen_variables <- patients_labelled6 %>% 
+  summary_factorlist(dependent_icu_adm,
+                     explanatory_icu_adm, 
+                     na_include=TRUE, na_include_dependent = TRUE, 
+                    total_col = TRUE, add_col_totals = TRUE,  p=TRUE) %>% view()
+
+icu_adm_characteristics_table_chosen_variables_concise <- patients_labelled6 %>% 
+  summary_factorlist(dependent_icu_adm,
+                     explanatory_icu_adm_concise, add_dependent_label = TRUE, dependent_label_prefix = "",
+                     na_include=TRUE, na_include_dependent = TRUE, 
+                     add_col_totals = TRUE,  p=TRUE) %>% view()
+
+# Create table showing proportions at each level of Empty Beds Category 
+
+dependent_empty_beds = "EmptyBedsTimeofSurgCat"
+explanatory_empty_beds = c( "icu_adm.factor",
+          "age_p10", 
+          "asa" ,
+          "SORT_mort_perc_cat" ,
+         "POMS.factor"  ,
+         "S07PostopLOS"  ,
+          "mortality30.factor")
+
+empty_beds_cat_table <- patients_labelled6 %>% 
+  summary_factorlist(dependent_empty_beds,
+                     explanatory_empty_beds, add_dependent_label = TRUE, dependent_label_prefix = "",
+                     add_col_totals = TRUE,  p=TRUE) %>% view()
+
+# Save objects for separate knitr/markdown file for export
+save(icu_adm_characteristics_table_chosen_variables, icu_adm_characteristics_table_chosen_variables_concise, empty_beds_cat_table, file = "out_clean.rda")
+save(icu_adm_characteristics_table_chosen_variables_concise, file = "icu_adm_characteristics_table_chosen_variables_concise.rda")
+save(icu_adm_characteristics_table_chosen_variables, file = "icu_adm_characteristics_table_chosen_variables.rda")
+```
+
+# Missing data handling {.tabset}
+
+Impute missing data in blood tests as "normal"
+```{r}
+# create variable that indicates if a blood test value was imputed
+patients_labelled6_imputed <- patients_labelled6 %>% 
+  mutate(imputed_creatinine = ifelse(is.na(creatinine_category.factor), 1, 0)) %>% 
+  mutate(imputed_urea = ifelse(is.na(urea_category.factor), 1, 0)) %>% 
+  mutate(imputed_hb = ifelse(is.na(hb_category.factor), 1, 0)) %>% 
+  mutate(imputed_sodium = ifelse(is.na(sodium_category.factor), 1, 0)) %>% 
+  mutate(imputed_potassium = ifelse(is.na(potassium_category.factor), 1, 0)) %>% 
+  mutate(imputed_wcc = ifelse(is.na(wcc_category.factor), 1, 0)) %>% 
+  mutate(imputed_hba1c = ifelse(is.na(hba1c_category.factor), 1, 0))
+
+# create variables where missing blood test values are imputed as "normal"
+patients_labelled6_imputed <- patients_labelled6_imputed %>% 
+  mutate(impute_normal_creatinine_category = case_when(is.na(creatinine_category.factor) ~ "Normal",
+                                                              TRUE ~ as.character(creatinine_category.factor))) %>% 
+  mutate(impute_normal_creatinine_category.factor = factor(impute_normal_creatinine_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>%  
+  mutate(impute_normal_urea_category = case_when(is.na(urea_category.factor) ~ "Normal",
+                                                              TRUE ~ as.character(urea_category.factor))) %>% 
+  mutate(impute_normal_urea_category.factor = factor(impute_normal_urea_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+  mutate(impute_normal_hb_category = case_when(is.na(hb_category.factor) ~ "Normal",
+                                                              TRUE ~ as.character(hb_category.factor))) %>% 
+  mutate(impute_normal_hb_category.factor = factor(impute_normal_hb_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+  mutate(impute_normal_sodium_category = case_when(is.na(sodium_category.factor) ~ "Normal",
+                                                              TRUE ~ as.character(sodium_category.factor))) %>% 
+  mutate(impute_normal_sodium_category.factor = factor(impute_normal_sodium_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+  mutate(impute_normal_potassium_category = case_when(is.na(potassium_category.factor) ~ "Normal",
+                                                              TRUE ~ as.character(potassium_category.factor))) %>% 
+  mutate(impute_normal_potassium_category.factor = factor(impute_normal_potassium_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+  mutate(impute_normal_wcc_category = case_when(is.na(wcc_category.factor) ~ "Normal",
+                                                              TRUE ~ as.character(wcc_category.factor))) %>% 
+  mutate(impute_normal_wcc_category.factor = factor(impute_normal_wcc_category) %>% 
+           fct_relevel("Low", "Normal", "High")) %>% 
+  mutate(impute_normal_hba1c_category = case_when(is.na(hba1c_category.factor) ~ "Normal",
+                                                              TRUE ~ as.character(hba1c_category.factor))) %>% 
+  mutate(impute_normal_hba1c_category.factor = factor(impute_normal_hba1c_category) %>% 
+           fct_relevel("Normal", "High"))
+
+# create abnormal blood test variables which accounts for imputed blood tests  
+patients_labelled6_imputed <- patients_labelled6_imputed %>%
+  mutate(abnormal_bloodtest_impute_normal = ifelse(impute_normal_creatinine_category.factor == "Low" |
+                                                     impute_normal_creatinine_category.factor == "High" |
+                                                     impute_normal_urea_category.factor == "Low" |
+                                                     impute_normal_urea_category.factor == "High" |
+                                                     impute_normal_hb_category.factor == "Low" |
+                                                     impute_normal_hb_category.factor == "High" |
+                                                     impute_normal_sodium_category.factor == "Low" |
+                                                     impute_normal_sodium_category.factor == "High" |
+                                                     impute_normal_potassium_category.factor == "Low" |
+                                                     impute_normal_potassium_category.factor == "High" |
+                                                     impute_normal_wcc_category.factor == "Low" |
+                                                     impute_normal_wcc_category.factor == "High", 1, 0)) %>% 
+  mutate(abnormal_bloodtest_impute_normal.factor = factor(abnormal_bloodtest_impute_normal))
+
+
+save(patients_labelled6_imputed, file = 'patients_labelled6_imputed.rda')
+write_csv(patients_labelled6_imputed, file = 'patients_labelled6_imputed.csv')
+require(foreign) # write dta file for IV analyses in Stata
+# narrow dataset to just variables to be used in analyses
+patients_labelled6_imputed_dta <-patients_labelled6_imputed %>% 
+  dplyr::select(c(CCUCapacityTimeofSurgCat, CCUCapacityTimeofSurgery, EmptyBedsTimeofSurgery, EmptyBedsTimeofSurgCat, PropEmptyTimeofSurgery, POMS, POMS.factor, icu_adm.factor  , S01Gender  , Age_scaled  , age_p10, weekend.factor  ,  S02OperativeUrgency  , S02PlannedProcSeverity  , asa  ,  PreopLOS.factor  ,  combined_DHx  , combined_PMHx  , diabetes.factor  ,  sysBP_scaled  , HR_scaled  ,  Anaesthetist_grade_combined.factor  , Surgeon_grade_combined.factor , abnormal_bloodtest_impute_normal.factor , S04BloodLoss, SiteCode, SORT_mort_perc))
+write.dta(patients_labelled6_imputed_dta, "patients_labelled6_imputed.dta")
+```
+
+# Check Variability in outcomes and probability of Critical Care admission between hospital sites
+- This serves two purposes. Firstly, this provides evidence on whether we should cluster the analyses by hospital site (i.e. if there is lots of variability between sites, it makes sense to cluster). Secondly, it provides a 'baseline' variability in unadjusted analyses that we can then compare to in adjusted analyses (for patient-level and hospital level factors). 
+
+```{r}
+# Calculate the Median Odds Ratio (MOR) for POMS incidence by hospital site 
+## via https://stat.ethz.ch/pipermail/r-sig-mixed-models/2008q2/000874.html
+
+MOR <- function(my.var, digits = 2)
+          { # MOR arguments: my.var = variance associated with level 2 clustering variable
+            # digits = number of decimal places to which MOR value will be rounded.
+
+            Median.OR <- round(exp(sqrt(2*my.var)*qnorm(.75)), digits)
+            paste("Median Odds-Ratio (MOR) = ", Median.OR)  }
+
+## Run an empty random effects model to see the extent that the odds of outcomes vary between hospitals
+
+## POMS
+empty_random_effects_POMS <- patients_labelled6_imputed %>% 
+  glmer(POMS.factor ~ (1 | SiteCode), data =., family = "binomial")
+
+summary(empty_random_effects_POMS)
+random_parameters(empty_random_effects_POMS)
+# Between-group variance = 0.16
+my.var_empty_POMS <- 0.16
+MOR_empty_POMS <- my.var_empty_POMS %>% MOR() # 1.46
+
+## 30 day mortality
+empty_random_effects_mort30 <- patients_labelled6_imputed %>% 
+  glmer(mortality30.factor ~ (1 | SiteCode), data =., family = "binomial")
+
+random_parameters(empty_random_effects_mort30)
+my.var_empty_mort30 <- 0.14
+MOR_empty_mort30 <- my.var_empty_mort30 %>% MOR()
+
+## 60 day mortality
+empty_random_effects_mort60 <- patients_labelled6_imputed %>% 
+  glmer(mortality30.factor ~ (1 | SiteCode), data =., family = "binomial")
+
+random_parameters(empty_random_effects_mort60)
+my.var_empty_mort60 <- 0.14
+MOR_empty_mort60 <- my.var_empty_mort60 %>% MOR()
+
+## Run an empty random effects model to see the extent that the odds of critical care admission varies between hospitals
+
+## Critical care unit admission
+empty_random_effects_icu_adm <- patients_labelled6_imputed %>% 
+  glmer(icu_adm.factor ~ (1 | SiteCode), data =., family = "binomial")
+
+summary(empty_random_effects_icu_adm)
+odds_ratio_table_empty_random_effects_icu_adm <- empty_random_effects_icu_adm %>% tidy(conf.int = TRUE, exp = TRUE) 
+save(odds_ratio_table_empty_random_effects_icu_adm, file = 'odds_ratio_table_empty_random_effects_icu_adm.rda')
+random_parameters(empty_random_effects_icu_adm)
+# ICC is 0.24, variance = 1.04
+my.var_empty_icu_adm <- 1.04 #AIC 12086, BIC 12102 (no. obs = 19470, sites 248)
+MOR_empty_icu_adm <- my.var_empty_icu_adm %>% MOR()
+
+empty_random_effects_icu_adm_odds_ratio_table <- empty_random_effects_icu_adm %>% tidy(conf.int = TRUE, exp = TRUE) 
+
+
+# From the above, the MOR is ~1.43 for outcomes and ~2.65 for Critical care admission, suggesting a fair amount of variance depending on the hospital -> therefore it should be included in a random effects model. This also makes sense from a theoretical standpoint as different hospitals will admit to Critical care at different rates and have different outcomes.  
+```
+
+# Main Analyses (with imputed data) {.tabset}
+
+# Part 1 - Test whether the probability of admission to Critical Care is affected by bed availablity
+In the first part of this analysis, we use a multivariable logistic regression analysis to investigate the above question. We construct two models: one including only patient-level variables, as well as patient-level variables and hospital-level variables. These two models then have the MOR calculated for them to investigate how the addition of these variables explains the variability between hospital sites (these MORs are compared to the random-intercept only model calculated in the previous section). 
+
+## Run the MV regression for probability of Critical care admission depending on bed availability (including only patient-level variables, as well as patient-level variables and hospital-level variables). Also check how this affects the variability between hospital sites. 
+```{r}
+# run mv logistic regression including patient-level effects
+log_ccu_impute_norm_random_effect_critical_adverse_speciality_include <- patients_labelled6_imputed %>% 
+  filter(!(specialty.factor == "Other")) %>% 
+  glmer(icu_adm.factor ~ CCUCapacityTimeofSurgery  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss + specialty.factor + S04CriticalUnexpectedEventsPerioperatively + (1 | SiteCode), data =., family = "binomial", control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+
+summary(log_ccu_impute_norm_random_effect_critical_adverse_speciality_include) 
+log_odds_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include <- log_ccu_impute_norm_random_effect_critical_adverse_speciality_include %>% tidy(conf.int = TRUE, exp = FALSE) 
+save(log_odds_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include, file='log_odds_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include.rda')
+odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include <- log_ccu_impute_norm_random_effect_critical_adverse_speciality_include %>% tidy(conf.int = TRUE, exp = TRUE) 
+save(odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include, file='odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include.rda')
+
+random_parameters(log_ccu_impute_norm_random_effect_critical_adverse_speciality_include)
+my.var_random_effect_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include <- 1.37
+MOR_random_effect_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include <- my.var_random_effect_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include %>% MOR()
+
+# run regression including patient-level effects and hospital-level variable (i.e. total icu capacity)
+log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include <- patients_labelled6_imputed %>% 
+  filter(!(specialty.factor == "Other")) %>% 
+  glmer(icu_adm.factor ~ CCUCapacityTimeofSurgery  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss + specialty.factor + S04CriticalUnexpectedEventsPerioperatively + TotalCapacityTimeofSurgery + (1 | SiteCode), data =., family = "binomial", control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+
+summary(log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include) 
+log_odds_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include <- log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include %>% tidy(conf.int = TRUE, exp = FALSE) 
+save(log_odds_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include, file='log_odds_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include.rda')
+odds_ratio_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include <- log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include %>% tidy(conf.int = TRUE, exp = TRUE) 
+save(odds_ratio_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include, file='odds_ratio_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include.rda')
+
+random_parameters(log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include)
+my.var_random_effect_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include <- 1.37 
+MOR_random_effect_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include <- my.var_random_effect_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include %>% MOR()
+
+# Plot the model with patient-level effects only
+log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_plot <- plot_model(log_ccu_impute_norm_random_effect_critical_adverse_speciality_include, 
+           rm.terms = c("age_p10.L", 
+                       "age_p10.Q", 
+                       "age_p10.C",
+                      "age_p10^4", 
+                       "age_p10^5", 
+                       "age_p10^6"),
+           show.p = TRUE, show.values = TRUE, value.offset = 0.4, value.size = 3, vline.color = "red", 
+           title = "Probability of postoperative admission to Critical Care") +
+  scale_x_discrete(labels=list(
+    CCUCapacityTimeofSurgery = "Available CCU beds at time of surgery",
+    S01GenderMale = "Sex : Male", 
+    weekend.factorWeekend = "Weekend surgery",
+    S02OperativeUrgencyExpedited = "Operative Urgency : Expedited",
+    S02OperativeUrgencyUrgent = "Operative Urgency : Urgent", 
+    S02OperativeUrgencyImmediate = "Operative Urgency : Immediate",
+    S02PlannedProcSeverityIntermediate = "Procedure Severity : Intermediate",
+    S02PlannedProcSeverityMajor = "Procedure Severity : Major", 
+    S02PlannedProcSeverityXMajor = "Procedure Severity : XMajor",
+    S02PlannedProcSeverityComplex = "Procedure Severity : Complex",
+    asaII = "ASA II", 
+    asaIII = "ASA III",
+    'asaIV/V' = "ASA IV/V",
+    PreopLOS.factor1 = "Preoperative Length of Stay : 1 day",
+    'PreopLOS.factor2 to 6' = "Preoperative Length of Stay : 2 to 6 days", 
+    'PreopLOS.factor7 to 20' = "Preoperative Length of Stay : 7 to 20 days",
+    'PreopLOS.factor21 to 251' = "Preoperative Length of Stay : 21+ days",
+    combined_DHxTrue = "Positive drug history for listed medications", 
+    combined_PMHxTrue = "Positive past medical history of listed conditions",
+    'diabetes.factorT2DM - Diet Controlled' = "Diabetes : T2DM - Diet controlled",
+    'diabetes.factorT2DM - Oral medication' = "Diabetes : T2DM - Oral medication",
+    'diabetes.factorT2DM - Insulin controlled' = "Diabetes : T2DM - Insulin controlled",
+    'diabetes.factorT1DM' = "Diabetes : T1DM",
+    sysBP_scaled = "Pre-induction systolic BP (scaled)",
+    HR_scaled = "Pre-induction heart rate (scaled)",
+    'Anaesthetist_grade_combined.factorNon-consultant' = "Grade of most senior Anaesthetist : Non-consultant",
+    'Surgeon_grade_combined.factorNon-consultant' = "Grade of most senior Surgeon : Non-consultant",
+    abnormal_bloodtest_impute_normal.factor1 = "Abnormality on preoperative blood test",
+    'S04BloodLoss101-500ml' = "Estimated blood loss : 101-500mls",
+    'S04BloodLoss501-999ml' = "Estimated blood loss : 501-999mls",
+    'S04BloodLoss>1000ml' = "Estimated blood loss : > 1000mls", 
+    specialty.factorBreast = "Surgical specialty : Breast", 
+    specialty.factorCardiology = "Surgical specialty : Cardiology",
+    specialty.factorColorectal = "Surgical specialty : Colorectal",
+    specialty.factorEndocrine = "Surgical specialty : Endocrine",
+    specialty.factorEndoscopic = "Surgical specialty : Endoscopic",
+    specialty.factorENT = "Surgical specialty : ENT",
+    specialty.factorGynae = "Surgical specialty : Gynaecology",
+    specialty.factorHPB = "Surgical specialty : HPB",
+    specialty.factorIR = "Surgical specialty : Interventional Radiology",
+    'specialty.factorMaxFax-Dental' = "Surgical specialty : Max-Fax/Dental",
+    specialty.factorOpthalmic = "Surgical specialty : Opthalmic",
+    specialty.factorOrtho = "Surgical specialty : Orthopaedics",
+    specialty.factorPlastics = "Surgical specialty : Plastic Surgery",
+    specialty.factorSpine = "Surgical specialty : Spine",
+    specialty.factorThoracic = "Surgical specialty : Thoracic",
+    specialty.factorTransplant = "Surgical specialty : Transplant",
+    specialty.factorUpperGI = "Surgical specialty : Upper GI",
+    specialty.factorUrology = "Surgical specialty : Urology",
+    specialty.factorVascular = "Surgical specialty : Vascular",
+    S04CriticalUnexpectedEventsPerioperativelyTrue = "Critical Unexpected Events Perioperatively : True"
+  )) + 
+  scale_y_continuous(trans='log10') +
+  theme_classic()
+
+
+# Plot the model with patient-level effects only (with age as non-ordered factor to aid interpretability)
+patients_labelled6_imputed$age_p10_non_ordered <- factor(patients_labelled6_imputed$age_p10 , ordered = FALSE )
+
+log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder <- patients_labelled6_imputed %>% 
+  filter(!(specialty.factor == "Other")) %>% 
+  glmer(icu_adm.factor ~ CCUCapacityTimeofSurgery  + S01Gender  + age_p10_non_ordered  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss + specialty.factor + S04CriticalUnexpectedEventsPerioperatively + (1 | SiteCode), data =., family = "binomial", control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5)))
+
+summary(log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder ) 
+log_odds_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder  <- log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder  %>% tidy(conf.int = TRUE, exp = FALSE) 
+save(log_odds_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder , file='log_odds_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder.rda')
+odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder  <- log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder  %>% tidy(conf.int = TRUE, exp = TRUE) 
+save(odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder , file='odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder.rda')
+
+
+log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_plot_incl_age <- plot_model(log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder,
+           show.p = TRUE, show.values = TRUE, value.offset = 0.4, value.size = 3, vline.color = "red", title = "") +
+  scale_x_discrete(labels=list(
+    CCUCapacityTimeofSurgery = "Available CCU beds at time of surgery",
+    S01GenderMale = "Sex : Male", 
+    weekend.factorWeekend = "Weekend surgery",
+    S02OperativeUrgencyExpedited = "Operative Urgency : Expedited",
+    S02OperativeUrgencyUrgent = "Operative Urgency : Urgent", 
+    S02OperativeUrgencyImmediate = "Operative Urgency : Immediate",
+    S02PlannedProcSeverityIntermediate = "Procedure Severity : Intermediate",
+    S02PlannedProcSeverityMajor = "Procedure Severity : Major", 
+    S02PlannedProcSeverityXMajor = "Procedure Severity : XMajor",
+    S02PlannedProcSeverityComplex = "Procedure Severity : Complex",
+    asaII = "ASA II", 
+    asaIII = "ASA III",
+    'asaIV/V' = "ASA IV/V",
+    PreopLOS.factor1 = "Preoperative Length of Stay : 1 day",
+    'PreopLOS.factor2 to 6' = "Preoperative Length of Stay : 2 to 6 days", 
+    'PreopLOS.factor7 to 20' = "Preoperative Length of Stay : 7 to 20 days",
+    'PreopLOS.factor21 to 251' = "Preoperative Length of Stay : 21+ days",
+    combined_DHxTrue = "Positive drug history for listed medications", 
+    combined_PMHxTrue = "Positive past medical history of listed conditions",
+    'diabetes.factorT2DM - Diet Controlled' = "Diabetes : T2DM - Diet controlled",
+    'diabetes.factorT2DM - Oral medication' = "Diabetes : T2DM - Oral medication",
+    'diabetes.factorT2DM - Insulin controlled' = "Diabetes : T2DM - Insulin controlled",
+    'diabetes.factorT1DM' = "Diabetes : T1DM",
+    sysBP_scaled = "Pre-induction systolic BP (scaled)",
+    HR_scaled = "Pre-induction heart rate (scaled)",
+    'Anaesthetist_grade_combined.factorNon-consultant' = "Grade of most senior Anaesthetist : Non-consultant",
+    'Surgeon_grade_combined.factorNon-consultant' = "Grade of most senior Surgeon : Non-consultant",
+    abnormal_bloodtest_impute_normal.factor1 = "Abnormality on preoperative blood test",
+    'S04BloodLoss101-500ml' = "Estimated blood loss : 101-500mls",
+    'S04BloodLoss501-999ml' = "Estimated blood loss : 501-999mls",
+    'S04BloodLoss>1000ml' = "Estimated blood loss : > 1000mls", 
+    specialty.factorBreast = "Surgical specialty : Breast", 
+    specialty.factorCardiology = "Surgical specialty : Cardiology",
+    specialty.factorColorectal = "Surgical specialty : Colorectal",
+    specialty.factorEndocrine = "Surgical specialty : Endocrine",
+    specialty.factorEndoscopic = "Surgical specialty : Endoscopic",
+    specialty.factorENT = "Surgical specialty : ENT",
+    specialty.factorGynae = "Surgical specialty : Gynaecology",
+    specialty.factorHPB = "Surgical specialty : HPB",
+    specialty.factorIR = "Surgical specialty : Interventional Radiology",
+    'specialty.factorMaxFax-Dental' = "Surgical specialty : Max-Fax/Dental",
+    specialty.factorOpthalmic = "Surgical specialty : Opthalmic",
+    specialty.factorOrtho = "Surgical specialty : Orthopaedics",
+    specialty.factorPlastics = "Surgical specialty : Plastic Surgery",
+    specialty.factorSpine = "Surgical specialty : Spine",
+    specialty.factorThoracic = "Surgical specialty : Thoracic",
+    specialty.factorTransplant = "Surgical specialty : Transplant",
+    specialty.factorUpperGI = "Surgical specialty : Upper GI",
+    specialty.factorUrology = "Surgical specialty : Urology",
+    specialty.factorVascular = "Surgical specialty : Vascular",
+    S04CriticalUnexpectedEventsPerioperativelyTrue = "Critical Unexpected Events Perioperatively : True", 
+    'age_p10_non_ordered31 to 40' = "Age : 31 to 40",
+    'age_p10_non_ordered41 to 50' = "Age : 41 to 50",
+    'age_p10_non_ordered51 to 60' = "Age : 51 to 60",
+    'age_p10_non_ordered61 to 70' = "Age : 61 to 70",
+    'age_p10_non_ordered71 to 80' = "Age : 71 to 80",
+    'age_p10_non_ordered80+' = "Age : 80+"
+  )) + 
+  scale_y_continuous(trans='log10') +
+  ylab("Odds Ratio") +
+  xlab("Model feature") +
+  theme_classic()
+
+# save regression results into excel tables (with age as order & non-ordered factor)
+library(xlsx)
+write.xlsx(odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include, file = 'odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include.xlsx', sheetName = "Sheet1", 
+  col.names = TRUE, row.names = TRUE, append = FALSE)
+
+write.xlsx(odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder, file = 'odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder.xlsx', sheetName = "Sheet1", 
+  col.names = TRUE, row.names = TRUE, append = FALSE)
+```
+
+
+# Check if critical care capacity remains significant when model is restricted to the features included in the IV analysis models
+This analyses uses the same model features as the models investigating the effect of critical care admission on outcomes. This is a subset of the features in the above models (specialty and critical adverse events are removed). 
+- This is done as the model features need to be identical in both equations in the Instrumental variable analyses. Therefore it was necessary to check that, using these model features, there was a statistically significant effect of Critical care capacity on probability of admission - to permit it's inclusion as a valid instrument. 
+- The reasons for the narrowed feature set was that, although specialty and critical adverse events were relevant for one's probability of admission, the effect was less important for outcomes - and so they added extra, unnecessary dimensionality to the model with little explanatory power. 
+
+```{r}
+## Random effects model
+ log_ccu_impute_norm_random_effect <- patients_labelled6_imputed %>% 
+  glmer(icu_adm.factor ~ CCUCapacityTimeofSurgery  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss + (1 | SiteCode), data =., family = "binomial", control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5))) 
+
+summary( log_ccu_impute_norm_random_effect)
+log_odds_table_log_ccu_impute_norm_random_effect <- log_ccu_impute_norm_random_effect %>% broom.mixed::tidy(conf.int = TRUE, exp = FALSE) 
+save(log_odds_table_log_ccu_impute_norm_random_effect, file='log_odds_table_log_ccu_impute_norm_random_effect.rda')
+odds_ratio_table_log_ccu_impute_norm_random_effect <- log_ccu_impute_norm_random_effect %>% broom.mixed::tidy(conf.int = TRUE, exp = TRUE) 
+save(odds_ratio_table_log_ccu_impute_norm_random_effect, file='odds_ratio_table_log_ccu_impute_norm_random_effect.rda')
+```
+
+# Part 2 - Evaluate the effect of postoperative Critical Care admission on Outcomes
+
+## Unadjusted analyses
+## Primary outcome: POMS
+```{r, results=TRUE}
+# Run unadjusted logistic regression and save results
+POMS_impute_norm_unadj <- glm(POMS.factor ~ icu_adm.factor,
+                data = patients_labelled6_imputed,
+                family = "binomial")
+
+log_odds_table_POMS_impute_norm_unadj <- POMS_impute_norm_unadj %>% tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_POMS_impute_norm_unadj, file='log_odds_table_POMS_impute_norm_unadj.rda')
+odds_ratio_table_POMS_impute_norm_unadj <- POMS_impute_norm_unadj %>% tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_POMS_impute_norm_unadj, file='odds_ratio_table_POMS_impute_norm_unadj.rda')
+av_marg_eff_POMS_impute_norm_unadj <- margins(POMS_impute_norm_unadj, variables = c("icu_adm.factor")) %>% summary()
+
+```
+
+## Secondary outcomes: Mortality
+
+```{r}
+# 30 day
+# Run unadjusted logistic regression and save results
+mort30_impute_norm_unadj <- glm(mortality30.factor ~ icu_adm.factor,
+                data = patients_labelled6_imputed,
+                family = "binomial")
+
+log_odds_table_mort30_impute_norm_unadj <- mort30_impute_norm_unadj %>% tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_mort30_impute_norm_unadj, file='log_odds_table_mort30_impute_norm_unadj.rda')
+odds_ratio_table_mort30_impute_norm_unadj <- mort30_impute_norm_unadj %>% tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_mort30_impute_norm_unadj, file='odds_ratio_table_mort30_impute_norm_unadj.rda')
+av_marg_eff_mort30_impute_norm_unadj <- margins(mort30_impute_norm_unadj, variables = c("icu_adm.factor")) %>% summary()
+
+# 60 day
+# Run unadjusted logistic regression and save results
+mort60_impute_norm_unadj <- glm(mortality60.factor ~ icu_adm.factor,
+                data = patients_labelled6_imputed,
+                family = "binomial")
+
+log_odds_table_mort60_impute_norm_unadj <- mort60_impute_norm_unadj %>% tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_mort60_impute_norm_unadj, file='log_odds_table_mort60_impute_norm_unadj.rda')
+odds_ratio_table_mort60_impute_norm_unadj <- mort60_impute_norm_unadj %>% tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_mort60_impute_norm_unadj, file='odds_ratio_table_mort60_impute_norm_unadj.rda')
+av_marg_eff_mort60_impute_norm_unadj <- margins(mort60_impute_norm_unadj, variables = c("icu_adm.factor")) %>% summary()
+```
+
+## Secondary outcome: LOS
+```{r}
+library(MASS)
+library(magrittr)
+# Negative binomial regression used for count data
+los_impute_norm_unadj <- glm.nb(S07PostopLOS ~ icu_adm.factor, data = patients_labelled6_imputed)
+los_impute_norm_unadj %>% tidy(conf.int = TRUE, exp = TRUE)
+
+# OR 2.20 (2.10 to 2.32)
+```
+
+
+# Adjusted analyses
+For the adjusted analyses, 3 regression models were run for each outcome: A single-level logistic regression (i.e. without clustering on hospital site), A single-level logistic regression with cluster robust Std Errors (using hospital site as the cluster to adjust the Std Errors on), A multi-level (aka random effects) logistic regression with clustering by hospital site. This was done to compare the results between the different approaches. 
+- For the purposes of publication, the multi-level logistic regression was chosen as the most appropriate model to report results for. 
+
+## Primary outcome: POMS
+## Single-level logistic regression (without cluster SEs)
+```{r}
+POMS_impute_norm <- glm(POMS.factor ~ icu_adm.factor  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss,
+                data = patients_labelled6_imputed,
+                family = "binomial")
+
+summary(POMS_impute_norm)
+log_odds_table_POMS_impute_norm <- POMS_impute_norm %>% tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_POMS_impute_norm, file='log_odds_table_POMS_impute_norm.rda')
+odds_ratio_table_POMS_impute_norm <- POMS_impute_norm %>% tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_POMS_impute_norm, file='odds_ratio_table_POMS_impute_norm.rda')
+av_marg_eff_POMS_impute_norm <- margins(POMS_impute_norm, variables = c("icu_adm.factor")) %>% summary()
+```
+
+## Single-level logistic regression with cluster robust SEs
+```{r}
+
+POMS_impute_norm_cluster <- coeftest(POMS_impute_norm, vcov = vcovCL, cluster = ~ SiteCode)
+POMS_impute_norm_cluster # as expected the SEs are larger
+log_odds_table_POMS_impute_norm_cluster <- POMS_impute_norm_cluster %>% tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_POMS_impute_norm_cluster, file='log_odds_table_POMS_impute_norm_cluster.rda')
+odds_ratio_table_POMS_impute_norm_cluster <- log_odds_table_POMS_impute_norm_cluster %>%
+  mutate(OR_estimate = exp(estimate),
+         OR_conf.low = exp(conf.low),
+         OR_conf.high = exp(conf.high)) %>% 
+  dplyr::select(term, OR_estimate, OR_conf.low, OR_conf.high, p.value)
+save(odds_ratio_table_POMS_impute_norm_cluster, file='odds_ratio_table_POMS_impute_norm_cluster.rda')
+```
+
+## Random intercept model
+```{r}
+ POMS_impute_norm_random_effect <- patients_labelled6_imputed %>% 
+  glmer(POMS.factor ~ icu_adm.factor  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss + (1 | SiteCode), data =., family = "binomial", control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5))) 
+
+summary( POMS_impute_norm_random_effect)
+log_odds_table_POMS_impute_norm_random_effect <- POMS_impute_norm_random_effect %>% broom.mixed::tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_POMS_impute_norm_random_effect, file='log_odds_table_POMS_impute_norm_random_effect.rda')
+odds_ratio_table_POMS_impute_norm_random_effect <- POMS_impute_norm_random_effect %>% broom.mixed::tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_POMS_impute_norm_random_effect, file='odds_ratio_table_POMS_impute_norm_random_effect.rda')
+```
+
+# 30 day mortality
+
+## Single-level logistic regression (without cluster SEs)
+```{r}
+mort30_impute_norm <- glm(mortality30.factor ~ icu_adm.factor  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss,
+                data = patients_labelled6_imputed,
+                family = "binomial")
+
+summary(mort30_impute_norm)
+log_odds_table_mort30_impute_norm <- mort30_impute_norm %>% tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_mort30_impute_norm, file='log_odds_table_mort30_impute_norm.rda')
+odds_ratio_table_mort30_impute_norm <- mort30_impute_norm %>% tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_mort30_impute_norm, file='odds_ratio_table_mort30_impute_norm.rda')
+av_marg_eff_mort30_impute_norm <- margins(mort30_impute_norm, variables = c("icu_adm.factor")) %>% summary()
+```
+
+## Single-level logistic regression with cluster robust SEs
+```{r}
+
+mort30_impute_norm_cluster <- coeftest(mort30_impute_norm, vcov = vcovCL, cluster = ~ SiteCode)
+mort30_impute_norm_cluster
+log_odds_table_mort30_impute_norm_cluster <- mort30_impute_norm_cluster %>% tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_mort30_impute_norm_cluster, file='log_odds_table_mort30_impute_norm_cluster.rda')
+odds_ratio_table_mort30_impute_norm_cluster <- log_odds_table_mort30_impute_norm_cluster %>%
+  mutate(OR_estimate = exp(estimate),
+         OR_conf.low = exp(conf.low),
+         OR_conf.high = exp(conf.high)) %>% 
+  dplyr::select(term, OR_estimate, OR_conf.low, OR_conf.high, p.value)
+save(odds_ratio_table_mort30_impute_norm_cluster, file='odds_ratio_table_mort30_impute_norm_cluster.rda')
+```
+
+## Random intercept model
+```{r}
+ mort30_impute_norm_random_effect <- patients_labelled6_imputed %>% 
+  glmer(mortality30.factor ~ icu_adm.factor  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss + (1 | SiteCode), data =., family = "binomial", control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5))) 
+
+summary( mort30_impute_norm_random_effect)
+log_odds_table_mort30_impute_norm_random_effect <- mort30_impute_norm_random_effect %>% broom.mixed::tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_mort30_impute_norm_random_effect, file='log_odds_table_mort30_impute_norm_random_effect.rda')
+odds_ratio_table_mort30_impute_norm_random_effect <- mort30_impute_norm_random_effect %>% broom.mixed::tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_mort30_impute_norm_random_effect, file='odds_ratio_table_mort30_impute_norm_random_effect.rda')
+```
+
+# 60 day mortality
+
+## Single-level logistic regression (without cluster SEs)
+```{r}
+mort60_impute_norm <- glm(mortality60.factor ~ icu_adm.factor  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss,
+                data = patients_labelled6_imputed,
+                family = "binomial")
+
+summary(mort60_impute_norm)
+log_odds_table_mort60_impute_norm <- mort60_impute_norm %>% tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_mort60_impute_norm, file='log_odds_table_mort60_impute_norm.rda')
+odds_ratio_table_mort60_impute_norm <- mort60_impute_norm %>% tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_mort60_impute_norm, file='odds_ratio_table_mort60_impute_norm.rda')
+av_marg_eff_mort60_impute_norm <- margins(mort60_impute_norm, variables = c("icu_adm.factor")) %>% summary()
+```
+
+## Single-level logistic regression with cluster robust SEs
+```{r}
+mort60_impute_norm_cluster <- coeftest(mort60_impute_norm, vcov = vcovCL, cluster = ~ SiteCode)
+mort60_impute_norm_cluster
+log_odds_table_mort60_impute_norm_cluster <- mort60_impute_norm_cluster %>% tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_mort60_impute_norm_cluster, file='log_odds_table_mort60_impute_norm_cluster.rda')
+odds_ratio_table_mort60_impute_norm_cluster <- log_odds_table_mort60_impute_norm_cluster %>%
+  mutate(OR_estimate = exp(estimate),
+         OR_conf.low = exp(conf.low),
+         OR_conf.high = exp(conf.high)) %>% 
+  dplyr::select(term, OR_estimate, OR_conf.low, OR_conf.high, p.value)
+save(odds_ratio_table_mort60_impute_norm_cluster, file='odds_ratio_table_mort60_impute_norm_cluster.rda')
+```
+
+## Random intercept model
+```{r}
+ mort60_impute_norm_random_effect <- patients_labelled6_imputed %>% 
+  glmer(mortality60.factor ~ icu_adm.factor  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss + (1 | SiteCode), data =., family = "binomial", control=glmerControl(optimizer="bobyqa",
+                            optCtrl=list(maxfun=2e5))) 
+
+summary( mort60_impute_norm_random_effect)
+log_odds_table_mort60_impute_norm_random_effect <- mort60_impute_norm_random_effect %>% broom.mixed::tidy(conf.int = TRUE, exp = FALSE)
+save(log_odds_table_mort60_impute_norm_random_effect, file='log_odds_table_mort60_impute_norm_random_effect.rda')
+odds_ratio_table_mort60_impute_norm_random_effect <- mort60_impute_norm_random_effect %>% broom.mixed::tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_mort60_impute_norm_random_effect, file='odds_ratio_table_mort60_impute_norm_random_effect.rda')
+```
+
+# Combine results into tables
+```{r}
+# POMS
+a <- log_odds_table_POMS_impute_norm[2,]
+b <- log_odds_table_POMS_impute_norm_cluster[2,]
+c <- log_odds_table_POMS_impute_norm_random_effect[2, c(3,4,5,6,7,8,9)]
+d <- log_odds_table_POMS_impute_norm_unadj[2,]
+
+
+poms_impute_norm_log_odds_est <- rbind(a,b,c,d) %>% 
+  mutate(model = c("Single-level logistic regression (without cluster SE)", "Single-level logistic regression with cluster robust SEs", "Random intercept model", "Unadjusted logistic regression")) %>% 
+  dplyr::select("model", everything())
+
+save(poms_impute_norm_log_odds_est, file='poms_impute_norm_log_odds_est.rda')
+
+## mort 30
+a <- log_odds_table_mort30_impute_norm[2,]
+b <- log_odds_table_mort30_impute_norm_cluster[2,]
+c <- log_odds_table_mort30_impute_norm_random_effect[2, c(3,4,5,6,7,8,9)]
+d <- log_odds_table_mort30_impute_norm_unadj[2,]
+
+mort30_impute_norm_log_odds_est <- rbind(a,b,c,d) %>% 
+  mutate(model = c("Single-level logistic regression (without cluster SE)", "Single-level logistic regression with cluster robust SEs", "Random intercept model", "Unadjusted logistic regression")) %>% 
+  dplyr::select("model", everything())
+
+save(mort30_impute_norm_log_odds_est, file='mort30_impute_norm_log_odds_est.rda')
+
+#60 day mortality
+
+a <- log_odds_table_mort60_impute_norm[2,]
+b <- log_odds_table_mort60_impute_norm_cluster[2,]
+c <- log_odds_table_mort60_impute_norm_random_effect[2, c(3,4,5,6,7,8,9)]
+d <- log_odds_table_mort60_impute_norm_unadj[2,]
+
+mort60_impute_norm_log_odds_est <- rbind(a,b,c,d) %>% 
+  mutate(model = c("Single-level logistic regression (without cluster SE)", "Single-level logistic regression with cluster robust SEs", "Random intercept model", "Unadjusted logistic regression")) %>% 
+  dplyr::select("model", everything())
+
+save(mort60_impute_norm_log_odds_est, file='mort60_impute_norm_log_odds_est.rda')
+
+# Collect the Average Treatment Effects (aka marginal effects) into a table. These shall be used alongside the odds ratios to compare to the instrumental variable analysis results. 
+
+marginal_effects_table_impute_norm <- rbind(av_marg_eff_POMS_impute_norm, av_marg_eff_mort30_impute_norm, av_marg_eff_mort60_impute_norm) %>% 
+  mutate(model = c('POMS','mort30','mort60')) 
+save(marginal_effects_table_impute_norm, file='marginal_effects_table_impute_norm.rda')
+```
+
+
+### Post-op LOS
+```{r}
+los_impute_norm <- glm.nb(S07PostopLOS ~ icu_adm.factor  + S01Gender  + age_p10  + weekend.factor  +  S02OperativeUrgency  + S02PlannedProcSeverity  + asa  +  PreopLOS.factor  +  combined_DHx  + combined_PMHx  + diabetes.factor  +  sysBP_scaled  + HR_scaled  +  Anaesthetist_grade_combined.factor  + Surgeon_grade_combined.factor + abnormal_bloodtest_impute_normal.factor + S04BloodLoss,  
+                  data = patients_labelled6_imputed)
+
+log_odds_table_los_impute_norm <- los_impute_norm %>% tidy(conf.int = TRUE, exp = FALSE) 
+save(log_odds_table_los_impute_norm, file='log_odds_table_los_impute_norm.rda')
+odds_ratio_table_los_impute_norm <- los_impute_norm %>% tidy(conf.int = TRUE, exp = TRUE)
+save(odds_ratio_table_los_impute_norm, file='odds_ratio_table_los_impute_norm.rda')
+```
+
+# Plot regression results
+```{r}
+# Add an indicator to the results tables made earlier to signify which outcome the table refers to.
+poms_impute_norm_log_odds_est <- poms_impute_norm_log_odds_est %>% 
+  mutate(variable = "POMS") 
+poms_impute_norm_log_odds_est$model <-  paste("POMS", poms_impute_norm_log_odds_est$model, sep="_")
+
+mort30_impute_norm_log_odds_est <- mort30_impute_norm_log_odds_est %>% 
+  mutate(variable = "Mort30")
+mort30_impute_norm_log_odds_est$model <-  paste("Mort30", mort30_impute_norm_log_odds_est$model, sep="_")
+
+mort60_impute_norm_log_odds_est <- mort60_impute_norm_log_odds_est %>% 
+  mutate(variable = "Mort60")
+mort60_impute_norm_log_odds_est$model <-  paste("Mort60", mort60_impute_norm_log_odds_est$model, sep="_")
+
+# Combine the results for the various outcomes into one table
+impute_norm_log_odds_est_all_outcomes <- rbind(poms_impute_norm_log_odds_est, mort30_impute_norm_log_odds_est , mort60_impute_norm_log_odds_est) %>% 
+  mutate(variable = factor(variable)) %>% 
+  mutate(model = factor(model)) %>% 
+  mutate(or_est = exp(estimate),
+         or_min95 = exp(conf.low),
+         or_max95 = exp(conf.high)) %>% 
+  mutate(or_est = as.numeric(or_est),
+         or_min95 = as.numeric(or_min95),
+         or_max95 = as.numeric(or_max95)) 
+
+# Recode the variables before plotting to make it more interpretable
+impute_norm_log_odds_est_all_outcomes <- impute_norm_log_odds_est_all_outcomes %>% 
+  filter(model == "POMS_Unadjusted logistic regression" | model == "POMS_Random intercept model" | model == "Mort30_Unadjusted logistic regression" | model == "Mort30_Random intercept model" | model == "Mort60_Unadjusted logistic regression" | model == "Mort60_Random intercept model") %>% 
+  mutate(Model = fct_recode(model, 
+                          "Unadjusted regression (Day 7 POMS)" = "POMS_Unadjusted logistic regression", 
+                          "Multilevel multivariable regression (Day 7 POMS)" = "POMS_Random intercept model",
+                          "Unadjusted regression (30 day mortality)" = "Mort30_Unadjusted logistic regression", 
+                          "Multilevel multivariable regression (30 day mortality)" = "Mort30_Random intercept model",
+                          "Unadjusted regression (60 day mortality)" = "Mort60_Unadjusted logistic regression", 
+                          "Multilevel multivariable regression (60 day mortality)" = "Mort60_Random intercept model") %>% fct_relevel("Unadjusted regression (Day 7 POMS)", "Multilevel multivariable regression (Day 7 POMS)", "Unadjusted regression (30 day mortality)", "Multilevel multivariable regression (30 day mortality)" , "Unadjusted regression (60 day mortality)", "Multilevel multivariable regression (60 day mortality)")) %>% 
+  mutate(Outcome = fct_recode(variable,
+                              "Day 7 POMS" = "POMS",
+                              "30 day mortality" = "Mort30",
+                              "60 day mortality" = "Mort60"))
+
+# Plot the results for the various outcomes in the regression analyses
+impute_norm_log_odds_est_all_outcomes_regression_plot <-
+  ggplot(impute_norm_log_odds_est_all_outcomes, aes(Model, or_est)) +  
+  geom_point(aes(colour = Outcome), pch = 19) +
+  geom_errorbar(aes(ymin = or_min95, ymax = or_max95, colour = Outcome)) +
+  scale_y_continuous(trans='log10') + 
+  expand_limits(y = 0.5) +
+  geom_hline(yintercept = 1, linetype="dashed", 
+                color = "red", size=1) +
+  coord_flip() + 
+  xlab("Analysis") +
+  ylab("Odds Ratio (log scale)") + 
+  theme_classic() +
+  scale_color_manual(values = c("Day 7 POMS" = "black",
+                                "30 day mortality"="black",
+                                "60 day mortality"="black")) +
+  theme(plot.title=element_text(size=10)) +
+  ggtitle("") +
+  theme(legend.position="none")  +
+  theme(axis.title.y = element_text(margin = margin(r = 20))) +
+  theme(axis.title.x = element_text(margin = margin(t = 20)))
+```
+
+
+# IV analysis
+Load in results of IV analysis from Stata (run the Stata script "SNAP2_IV_Main_Analyses_Stata" to obtain the results which are loaded in here)
+```{r}
+# CCU Capacity model
+CCU_IV_POMS_pars_mv_impute_norm <- read_excel("CCU_IV_POMS_pars_mv_impute_norm_age_cat.xlsx") %>% dplyr::select("eq_label", "Parameter name", "parm_label", everything()) %>% subset(select = -c(`Parameter label`,`Equation name`, `eq_order`)) 
+
+## Combine into table
+a <- CCU_IV_POMS_pars_mv_impute_norm[c(2),]
+
+bivariate_probit_results_pars_mv_impute_norm <- a %>% 
+  mutate(model = "CCU Capacity (continuous)") %>% 
+  mutate(outcome = "POMS") %>% 
+  dplyr::select("model", "outcome", everything()) 
+
+save(bivariate_probit_results_pars_mv_impute_norm, file='bivariate_probit_results_pars_mv_impute_norm.rda')
+```
+
+# Plot IV with Regression results
+Note that only POMS outcome is plotted with IV results. For mortality estimates, only the regression results are plotted (IV analyses were not possible with mortality due to the low incidence of outcomes)
+```{r}
+# POMS
+## Odds ratios
+load('poms_impute_norm_log_odds_est.rda')
+iv_results_row <- c("Bivariate Probit", "icu_adm.factorTRUE", "", "", "", "", "", "", 0.8948352,	0.5632819,	1.421544) # taken from bivariate_probit_results_pars_mv_impute_norm.rda
+age_cat_y1 <- poms_impute_norm_log_odds_est %>% 
+  mutate(or_est = exp(estimate),
+         or_min95 = exp(conf.low),
+         or_max95 = exp(conf.high))
+age_cat_y1 <- rbind(age_cat_y1,iv_results_row) %>% 
+  mutate(or_est = as.numeric(or_est),
+         or_min95 = as.numeric(or_min95),
+         or_max95 = as.numeric(or_max95)) %>% 
+         mutate(model = factor(model) %>%
+  fct_relevel("Unadjusted logistic regression","Single-level logistic regression (without cluster SE)", "Single-level logistic regression with cluster robust SEs", "Random intercept model", "Bivariate Probit"))
+
+age_cat_y1_pub <- age_cat_y1 %>% 
+  filter(model == "Bivariate Probit" | model == "Random intercept model" |  model == "Unadjusted logistic regression") %>% 
+  mutate(Model = fct_recode(model, 
+                          "Unadjusted regression" = "Unadjusted logistic regression", 
+                          "Multilevel multivariable regression" = "Random intercept model",
+                          "Bivariate Probit IV analysis" = "Bivariate Probit")) 
+  
+
+POMS_all_results_impute_norm_plot_publication <- ggplot(age_cat_y1_pub, aes(Model, or_est)) +  
+  geom_point() +
+  geom_errorbar(aes(ymin = or_min95, ymax = or_max95)) +
+  scale_y_continuous(trans='log10') +
+  geom_hline(yintercept = 1, linetype="dashed", 
+                color = "red", size=1) +
+  coord_flip() + 
+  xlab("Analysis") +
+  ylab("Odds Ratio (log scale)") +
+  theme_classic() +
+  ggtitle("Odds Ratio plots for POMS incidence with different models") + 
+  expand_limits(y = 0.5) +
+  theme(axis.title.y = element_text(margin = margin(r = 20))) +
+  theme(axis.title.x = element_text(margin = margin(t = 20)))
+ 
+
+### Average Treatment effects (aka marginal effects)
+ 
+a <- marginal_effects_table_impute_norm[1,]
+b <- c("icu_adm.factorTRUE", -0.012, 0.025, -0.48, 0.631, -0.061, 0.037, "Bivariate Probit IV analysis") # ATE results are obtained when running the Stata script above. Results are manually copied across from Stata. 
+
+POMS_marginal_effects_results_impute_norm <- rbind(a,b) %>%  
+  dplyr::select("model", everything()) %>% 
+  mutate(model = factor(model) %>% 
+  fct_relevel("POMS","Bivariate Probit IV analysis") %>% 
+  fct_recode(
+    "Logistic regression" = "POMS"
+  )) %>%  
+  mutate(AME = as.numeric(AME),
+         lower = as.numeric(lower),
+         upper = as.numeric(upper))
+
+## Plot mv logistic regression vs Bivariate probit
+POMS_marginal_effects_results_impute_norm_plot <- 
+  ggplot(POMS_marginal_effects_results_impute_norm, aes(model, AME)) +  
+  geom_point() +
+  geom_errorbar(aes(ymin = lower, ymax = upper)) +
+  geom_hline(yintercept = 0, linetype="dashed", 
+                color = "red", size=1) +
+  ylab("Average Treatment Effect") +
+  coord_flip() + 
+  theme_classic() +
+  ggtitle("POMS marginal effects results")
+
+## Plot unadj logistic regression vs mv logistic regression vs Bivariate probit
+a <- av_marg_eff_POMS_impute_norm_unadj %>% mutate(Analysis = "Unadjusted regression")
+b <- marginal_effects_table_impute_norm[1,c(1,2,3,4,5,6,7)] %>%  mutate(Analysis = "Multilevel multivariable regression")
+ame_log_reg <- rbind(a,b)
+c <- c("icu_adm.factorTRUE", -0.012, 0.025, -0.48, 0.631, -0.061, 0.037, "Bivariate Probit IV analysis")
+
+ame_iv_log_combined <- rbind(ame_log_reg, c) %>% 
+  mutate(AME = as.numeric(AME),
+           lower = as.numeric(lower),
+         upper = as.numeric(upper)) %>% 
+  mutate(Analysis = factor(Analysis) %>% 
+           fct_relevel("Unadjusted regression", "Multilevel multivariable regression", "Bivariate Probit IV analysis"))
+
+POMS_marginal_effects_results_impute_norm_iv_log_combined_plot <- ggplot(ame_iv_log_combined, aes(Analysis, AME)) +  
+  geom_point() +
+  geom_errorbar(aes(ymin = lower, ymax = upper)) +
+  geom_hline(yintercept = 0, linetype="dashed", 
+                color = "red", size=1) +
+  ylab("Average Treatment Effect") +
+  coord_flip() + 
+  theme_classic() +
+  ggtitle("ATE plots for POMS incidence with different models") +
+  expand_limits(y = -0.1) +
+  theme(axis.title.y = element_text(margin = margin(r = 20))) +
+  theme(axis.title.x = element_text(margin = margin(t = 20)))
+
+# Combine POMS plots together for publication
+combined_poms_impute_norm_pub_plot <- POMS_all_results_impute_norm_plot_publication / POMS_marginal_effects_results_impute_norm_iv_log_combined_plot 
+combined_poms_impute_norm_pub_plot <- combined_poms_impute_norm_pub_plot + plot_annotation(tag_levels = 'a')
+
+
+# 30 day mortality 
+## Odds ratios
+load('mort30_impute_norm_log_odds_est.rda')
+age_cat_y2 <- mort30_impute_norm_log_odds_est %>% 
+  mutate(or_est = exp(estimate),
+         or_min95 = exp(conf.low),
+         or_max95 = exp(conf.high))
+age_cat_y2 <-   age_cat_y2 %>% 
+  mutate(or_est = as.numeric(or_est),
+         or_min95 = as.numeric(or_min95),
+         or_max95 = as.numeric(or_max95)) %>% 
+         mutate(model = factor(model) %>%
+  fct_relevel("Single-level logistic regression (without cluster SE)", "Single-level logistic regression with cluster robust SEs", "Random intercept model"))
+
+
+mort30_all_results_pars_mv_impute_norm_plot <- ggplot(age_cat_y2, aes(model, or_est)) +  
+  geom_point() +
+  geom_errorbar(aes(ymin = or_min95, ymax = or_max95)) +
+  scale_y_continuous(trans='log10') +
+  geom_hline(yintercept = 1, linetype="dashed", 
+                color = "red", size=1) +
+  coord_flip() + 
+  ylab("Odds Ratio (log scale)") +
+  theme_classic() +
+  ggtitle("Odds Ratio plots for 30-day mortality incidence with different models")
+
+### Average Treatment effects (aka marginal effects)
+ 
+a <- marginal_effects_table_impute_norm[2,]
+
+mort30_marginal_effects_results_impute_norm <- a %>%  
+  dplyr::select("model", everything()) %>% 
+  mutate(model = factor(model) %>% 
+  fct_relevel("mort30")) %>% 
+  mutate(AME = as.numeric(AME),
+         lower = as.numeric(lower),
+         upper = as.numeric(upper))
+
+mort30_marginal_effects_results_impute_norm_plot <- ggplot(mort30_marginal_effects_results_impute_norm, aes(model, AME)) +  
+  geom_point() +
+  geom_errorbar(aes(ymin = lower, ymax = upper)) +
+  geom_hline(yintercept = 0, linetype="dashed", 
+                color = "red", size=1) +
+  ylab("Average Treatment Effect") +
+  coord_flip() + 
+  theme_classic() +
+  ggtitle("ATE for 30-day mortality incidence in regression analysis")
+
+# 60 day mortality
+## Odds ratios
+load('mort60_impute_norm_log_odds_est.rda')
+age_cat_y3 <- mort60_impute_norm_log_odds_est %>% 
+  mutate(or_est = exp(estimate),
+         or_min95 = exp(conf.low),
+         or_max95 = exp(conf.high))
+age_cat_y3 <-   age_cat_y3 %>% 
+  mutate(or_est = as.numeric(or_est),
+         or_min95 = as.numeric(or_min95),
+         or_max95 = as.numeric(or_max95)) %>% 
+         mutate(model = factor(model) %>%
+  fct_relevel("Single-level logistic regression (without cluster SE)", "Single-level logistic regression with cluster robust SEs", "Random intercept model"))
+
+
+mort60_all_results_impute_norm_plot <- ggplot(age_cat_y3, aes(model, or_est)) +  
+  geom_point() +
+  geom_errorbar(aes(ymin = or_min95, ymax = or_max95)) +
+  scale_y_continuous(trans='log10') +
+  geom_hline(yintercept = 1, linetype="dashed", 
+                color = "red", size=1) +
+  coord_flip() + 
+  ylab("Odds Ratio (log scale)") +
+  theme_classic() +
+  ggtitle("Odds Ratio plots for 60-day mortality incidence with different models")
+
+### Average Treatment effects (aka marginal effects)
+ 
+a <- marginal_effects_table_impute_norm[3,]
+
+mort60_marginal_effects_results_impute_norm <- a %>%  
+  dplyr::select("model", everything()) %>% 
+  mutate(model = factor(model) %>% 
+  fct_relevel("mort60")) %>% 
+  mutate(AME = as.numeric(AME),
+         lower = as.numeric(lower),
+         upper = as.numeric(upper))
+
+mort60_marginal_effects_results_impute_norm_plot <- ggplot(mort60_marginal_effects_results_impute_norm , aes(model, AME)) +  
+  geom_point() +
+  geom_errorbar(aes(ymin = lower, ymax = upper)) +
+  geom_hline(yintercept = 0, linetype="dashed", 
+                color = "red", size=1) +
+  ylab("Average Treatment Effect") +
+  coord_flip() + 
+  theme_classic() +
+  ggtitle("ATE for 30-day mortality incidence in regression analysis")
+
+```
