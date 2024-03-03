@@ -5,9 +5,11 @@ date: '2023-10-18'
 output: html_document
 ---
 
-This script was run using R Version 4.0.3 in RStudio Version 1.2.5033. It utilises results generated from Stata scripts run using Stata Release 17. 
+This script was run using R Version 4.0.3 in RStudio Version 1.2.5033. It utilises results generated from Stata scripts run using Stata Release 17. Which Stata scripts should be run at which time are indicated during the course of the script. As a result, although this is a R markdown file, Knitting the file generate errors. It should therefore be run code-chunk by code-chunk. 
 
 NB - Please note that ICU (Intensive Care Unit) & CCU (Critical Care Unit) are used interchangeably throughout this script. As per the Methods section of the manuscript, they both refer to any of an Intensive Care Unit, High Dependency Unit, Post-Anaesthetic Recovery Unit or an Overnight Intensive Recovery Unit. 
+
+
 
 # Load libraries needed
 ```{r}
