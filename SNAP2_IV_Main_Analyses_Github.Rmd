@@ -1,15 +1,13 @@
 ---
 title: "R markdown script for main analysis of SNAP2 data - for Github repo"
 author: "Ruaraidh Campbell"
-date: '2024-03-03'
+date: '2023-10-18'
 output: html_document
 ---
 
-This script was run using R Version 4.0.3 in RStudio Version 1.2.5033. It utilises results generated from Stata scripts run using Stata Release 17. Which Stata scripts should be run at which time are indicated during the course of the script. As a result, although this is a R markdown file, Knitting the file generate errors. It should therefore be run code-chunk by code-chunk. 
+This script was run using R Version 4.0.3 in RStudio Version 1.2.5033. It utilises results generated from Stata scripts run using Stata Release 17. 
 
 NB - Please note that ICU (Intensive Care Unit) & CCU (Critical Care Unit) are used interchangeably throughout this script. As per the Methods section of the manuscript, they both refer to any of an Intensive Care Unit, High Dependency Unit, Post-Anaesthetic Recovery Unit or an Overnight Intensive Recovery Unit. 
-
-
 
 # Load libraries needed
 ```{r}
@@ -742,6 +740,7 @@ patients_labelled4 <- patients_labelled3 %>%
   # 7.2 = (Vascular, Thoracic Vessels), 7.4 = (Vascular, Abdominal vessels)
   filter(!(S02PlannedProcedure %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com"))) %>%
   # 9-6-45-Com = Liver transplant, 9-6-46-Com = Liver and Kidney transplant, 9-6-47-Com = Bowel Transplant
+    filter(!(specialty.factor == 'Transplant')) %>% # All other transplants
   filter(!(S02PlannedProcedureMainGroup == "14") | is.na(S02PlannedProcedureMainGroup)) # 14 = Neurosurgery
 
 #create list of excluded procedures
@@ -751,7 +750,9 @@ excluded_procedures_clean <- SNAP2_procedurelist_specialty_coded %>%
   (Code %in% c("6-5-14-Com", "6-5-15-Com", "6-5-8-Com", "6-5-20-Com", "6-5-22-Com")) |
   (SurgeryProcedureMainGroupId == "7" & SurgeryProcedureSubGroupId %in% c("2", "4")) |
   (Code %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com")) |
-  (SurgeryProcedureMainGroupId == "14")) %>% 
+  (SurgeryProcedureMainGroupId == "14") |
+  (Specialty == 'Transplant')
+  ) %>% 
   dplyr::select(Code, SurgeryProcedure, SurgeryProcedureSeverity, Specialty)
   
 #create list of cases excluded due to surgical procedure + tally to identify most commonly excluded procedure
@@ -762,8 +763,10 @@ excluded_procedures_clean_patient_list <- patients_labelled3 %>%
   (S02PlannedProcedure %in% c("6-5-14-Com", "6-5-15-Com", "6-5-8-Com", "6-5-20-Com", "6-5-22-Com")) |
   (S02PlannedProcedureMainGroup == "7" & S02PlannedProcedureSubGroup %in% c("2", "4")) |
   (S02PlannedProcedure %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com")) |
-  (S02PlannedProcedureMainGroup == "14")) %>% 
-  dplyr::select(CaseId, SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y) #453 patients
+  (S02PlannedProcedureMainGroup == "14") |
+  (specialty.factor == 'Transplant')  
+  ) %>% 
+  dplyr::select(CaseId, SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y)
   
 excluded_procedures_clean_tally <- excluded_procedures_clean_patient_list %>% 
   dplyr::select(SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y) %>% 
@@ -797,7 +800,8 @@ excluded_procedures_clean <- SNAP2_procedurelist_specialty_coded %>%
   (SurgeryProcedureMainGroupId == "7" & SurgeryProcedureSubGroupId %in% c("2", "4")) |
   (Code %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com")) |
   (SurgeryProcedureMainGroupId == "14") |
-  (SurgeryProcedureMainGroupId == "15")   
+  (SurgeryProcedureMainGroupId == "15") |
+  (Specialty == 'Transplant')    
   ) %>% 
   dplyr::select(Code, SurgeryProcedure, SurgeryProcedureSeverity, Specialty)
   
@@ -810,9 +814,10 @@ excluded_procedures_clean_patient_list <- patients_labelled3 %>%
   (S02PlannedProcedureMainGroup == "7" & S02PlannedProcedureSubGroup %in% c("2", "4")) |
   (S02PlannedProcedure %in% c("9-6-45-Com" , "9-6-46-Com", "9-6-47-Com")) |
   (S02PlannedProcedureMainGroup == "14")  |
-  (SurgeryProcedureMainGroupId == "15")
+  (SurgeryProcedureMainGroupId == "15") |
+  (specialty.factor == 'Transplant')  
   ) %>% 
-  dplyr::select(CaseId, SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y) #453 patients
+  dplyr::select(CaseId, SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y) 
   
 excluded_procedures_clean_tally <- excluded_procedures_clean_patient_list %>% 
   dplyr::select(SurgeryProcedure, SurgeryProcedureSeverity, MainGroup, Specialty.y) %>% 
@@ -1088,7 +1093,7 @@ empty_random_effects_mort30 <- patients_labelled6_imputed %>%
   glmer(mortality30.factor ~ (1 | SiteCode), data =., family = "binomial")
 
 random_parameters(empty_random_effects_mort30)
-my.var_empty_mort30 <- 0.14
+my.var_empty_mort30 <- 0.15
 MOR_empty_mort30 <- my.var_empty_mort30 %>% MOR()
 
 ## 60 day mortality
@@ -1096,7 +1101,7 @@ empty_random_effects_mort60 <- patients_labelled6_imputed %>%
   glmer(mortality30.factor ~ (1 | SiteCode), data =., family = "binomial")
 
 random_parameters(empty_random_effects_mort60)
-my.var_empty_mort60 <- 0.14
+my.var_empty_mort60 <- 0.15
 MOR_empty_mort60 <- my.var_empty_mort60 %>% MOR()
 
 ## Run an empty random effects model to see the extent that the odds of critical care admission varies between hospitals
@@ -1106,17 +1111,17 @@ empty_random_effects_icu_adm <- patients_labelled6_imputed %>%
   glmer(icu_adm.factor ~ (1 | SiteCode), data =., family = "binomial")
 
 summary(empty_random_effects_icu_adm)
-odds_ratio_table_empty_random_effects_icu_adm <- empty_random_effects_icu_adm %>% tidy(conf.int = TRUE, exp = TRUE) 
+odds_ratio_table_empty_random_effects_icu_adm <- empty_random_effects_icu_adm %>% broom.mixed::tidy(conf.int = TRUE, exp = TRUE) 
 save(odds_ratio_table_empty_random_effects_icu_adm, file = 'odds_ratio_table_empty_random_effects_icu_adm.rda')
 random_parameters(empty_random_effects_icu_adm)
-# ICC is 0.24, variance = 1.04
-my.var_empty_icu_adm <- 1.04 #AIC 12086, BIC 12102 (no. obs = 19470, sites 248)
+# variance = 1.04
+my.var_empty_icu_adm <- 1.04 #AIC 12018, BIC 12033 (no. obs = 19386, sites 248)
 MOR_empty_icu_adm <- my.var_empty_icu_adm %>% MOR()
 
 empty_random_effects_icu_adm_odds_ratio_table <- empty_random_effects_icu_adm %>% tidy(conf.int = TRUE, exp = TRUE) 
 
 
-# From the above, the MOR is ~1.43 for outcomes and ~2.65 for Critical care admission, suggesting a fair amount of variance depending on the hospital -> therefore it should be included in a random effects model. This also makes sense from a theoretical standpoint as different hospitals will admit to Critical care at different rates and have different outcomes.  
+# From the above, the MOR is ~1.45 for outcomes and ~2.65 for Critical care admission, suggesting a fair amount of variance depending on the hospital -> therefore it should be included in a random effects model. This also makes sense from a theoretical standpoint as different hospitals will admit to Critical care at different rates and have different outcomes.  
 ```
 
 # Main Analyses (with imputed data) {.tabset}
@@ -1155,7 +1160,7 @@ odds_ratio_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalca
 save(odds_ratio_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include, file='odds_ratio_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include.rda')
 
 random_parameters(log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include)
-my.var_random_effect_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include <- 1.37 
+my.var_random_effect_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include <- 1.38 
 MOR_random_effect_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include <- my.var_random_effect_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include %>% MOR()
 
 # Plot the model with patient-level effects only
@@ -1312,6 +1317,9 @@ write.xlsx(odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_s
   col.names = TRUE, row.names = TRUE, append = FALSE)
 
 write.xlsx(odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder, file = 'odds_ratio_table_log_ccu_impute_norm_random_effect_critical_adverse_speciality_include_age_nonorder.xlsx', sheetName = "Sheet1", 
+  col.names = TRUE, row.names = TRUE, append = FALSE)
+
+write.xlsx(odds_ratio_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include, file = 'odds_ratio_table_log_ccu_age_cat_impute_norm_critical_adverse_speciality_totalcap_include.xlsx', sheetName = "Sheet1", 
   col.names = TRUE, row.names = TRUE, append = FALSE)
 ```
 
@@ -1673,7 +1681,7 @@ Note that only POMS outcome is plotted with IV results. For mortality estimates,
 # POMS
 ## Odds ratios
 load('poms_impute_norm_log_odds_est.rda')
-iv_results_row <- c("Bivariate Probit", "icu_adm.factorTRUE", "", "", "", "", "", "", 0.8948352,	0.5632819,	1.421544) # taken from bivariate_probit_results_pars_mv_impute_norm.rda
+iv_results_row <- c("Bivariate Probit", "icu_adm.factorTRUE", "", "", "", "", "", "", 0.91,	0.57,	1.45) # taken from bivariate_probit_results_pars_mv_impute_norm.rda
 age_cat_y1 <- poms_impute_norm_log_odds_est %>% 
   mutate(or_est = exp(estimate),
          or_min95 = exp(conf.low),
@@ -1703,7 +1711,7 @@ POMS_all_results_impute_norm_plot_publication <- ggplot(age_cat_y1_pub, aes(Mode
   xlab("Analysis") +
   ylab("Odds Ratio (log scale)") +
   theme_classic() +
-  ggtitle("Odds Ratio plots for POMS incidence with different models") + 
+  ggtitle("") + 
   expand_limits(y = 0.5) +
   theme(axis.title.y = element_text(margin = margin(r = 20))) +
   theme(axis.title.x = element_text(margin = margin(t = 20)))
@@ -1712,7 +1720,7 @@ POMS_all_results_impute_norm_plot_publication <- ggplot(age_cat_y1_pub, aes(Mode
 ### Average Treatment effects (aka marginal effects)
  
 a <- marginal_effects_table_impute_norm[1,]
-b <- c("icu_adm.factorTRUE", -0.012, 0.025, -0.48, 0.631, -0.061, 0.037, "Bivariate Probit IV analysis") # ATE results are obtained when running the Stata script above. Results are manually copied across from Stata. 
+b <- c("icu_adm.factorTRUE", -0.010, 0.025, -0.38, 0.701, -0.059, 0.040, "Bivariate Probit IV analysis") # ATE results are obtained when running the Stata script above. Results are manually copied across from Stata. 
 
 POMS_marginal_effects_results_impute_norm <- rbind(a,b) %>%  
   dplyr::select("model", everything()) %>% 
@@ -1741,7 +1749,7 @@ POMS_marginal_effects_results_impute_norm_plot <-
 a <- av_marg_eff_POMS_impute_norm_unadj %>% mutate(Analysis = "Unadjusted regression")
 b <- marginal_effects_table_impute_norm[1,c(1,2,3,4,5,6,7)] %>%  mutate(Analysis = "Multilevel multivariable regression")
 ame_log_reg <- rbind(a,b)
-c <- c("icu_adm.factorTRUE", -0.012, 0.025, -0.48, 0.631, -0.061, 0.037, "Bivariate Probit IV analysis")
+c <- c("icu_adm.factorTRUE", -0.010, 0.025, -0.38, 0.701, -0.059, 0.040, "Bivariate Probit IV analysis")
 
 ame_iv_log_combined <- rbind(ame_log_reg, c) %>% 
   mutate(AME = as.numeric(AME),
@@ -1758,7 +1766,7 @@ POMS_marginal_effects_results_impute_norm_iv_log_combined_plot <- ggplot(ame_iv_
   ylab("Average Treatment Effect") +
   coord_flip() + 
   theme_classic() +
-  ggtitle("ATE plots for POMS incidence with different models") +
+  ggtitle("") +
   expand_limits(y = -0.1) +
   theme(axis.title.y = element_text(margin = margin(r = 20))) +
   theme(axis.title.x = element_text(margin = margin(t = 20)))
