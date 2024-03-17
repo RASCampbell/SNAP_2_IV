@@ -1,16 +1,13 @@
 ---
 title: "SNAP2_IV_Sensitivity_Analyses_Github"
 author: "Ruaraidh Campbell"
-date: '2024-03-03'
+date: '2024-02-22'
 output: html_document
 ---
 
 This R Markdown script should be run only after the Main_Analyses script. This is because it uses datasets & the MOR (Median Odds Ratio) function generated in the course of the the Main_Analyses script. 
 
-This script was run using R Version 4.0.3 in RStudio Version 1.2.5033. It utilises results generated from Stata scripts run using Stata Release 17. Which Stata scripts should be run at which time are indicated during the course of the script. As a result, although this is a R markdown file, Knitting the file generate errors. It should therefore be run code-chunk by code-chunk. 
-
-NB - Please note that ICU (Intensive Care Unit) & CCU (Critical Care Unit) are used interchangeably throughout this script. As per the Methods section of the manuscript, they both refer to any of an Intensive Care Unit, High Dependency Unit, Post-Anaesthetic Recovery Unit or an Overnight Intensive Recovery Unit. 
-
+This script was run using R Version 4.0.3 in RStudio Version 1.2.5033. It utilises results generated from Stata scripts run using Stata Release 17.
 
 # Load libraries needed
 ```{r}
@@ -406,9 +403,9 @@ IN SUMMARY: repeating the analysis including the excluded patients does not sign
 # Sensitivity Analysis 2: Complete Case Analysis
 Create dataset of complete case patients
 ```{r}
-# Complete case datset for POMS
+# Complete case dataset for POMS
 complete_case_data_poms <- patients_labelled6 %>% 
-  dplyr::select(POMS.factor, icu_adm.factor,  S01Gender  , age_p10  , weekend.factor  ,  S02OperativeUrgency  , S02PlannedProcSeverity  , asa  ,  PreopLOS.factor  ,  combined_DHx  , combined_PMHx  , diabetes.factor  ,  sysBP_scaled  , HR_scaled  ,  Anaesthetist_grade_combined.factor  , Surgeon_grade_combined.factor , abnormal_bloodtest.factor , S04BloodLoss , SiteCode )
+  dplyr::select(POMS, POMS.factor, icu_adm.factor,  S01Gender  , Age_scaled, age_p10  , weekend.factor  ,  S02OperativeUrgency  , S02PlannedProcSeverity  , asa  ,  PreopLOS.factor  ,  combined_DHx  , combined_PMHx  , diabetes.factor  ,  sysBP_scaled  , HR_scaled  ,  Anaesthetist_grade_combined.factor  , Surgeon_grade_combined.factor , abnormal_bloodtest.factor , S04BloodLoss , SiteCode, CCUCapacityTimeofSurgery )
 
 complete_case_data_poms <- complete_case_data_poms[complete.cases(complete_case_data_poms), ]
 
@@ -417,13 +414,13 @@ write.dta(complete_case_data_poms, "complete_case_data_poms.dta")
 
 # Complete case datset for 30 day mortality
 complete_case_data_mort30 <- patients_labelled6 %>% 
-  dplyr::select(mortality30.factor, icu_adm.factor,  S01Gender  , age_p10  , weekend.factor  ,  S02OperativeUrgency  , S02PlannedProcSeverity  , asa  ,  PreopLOS.factor  ,  combined_DHx  , combined_PMHx  , diabetes.factor  ,  sysBP_scaled  , HR_scaled  ,  Anaesthetist_grade_combined.factor  , Surgeon_grade_combined.factor , abnormal_bloodtest.factor , S04BloodLoss , SiteCode )
+  dplyr::select(mortality30.factor, icu_adm.factor,  S01Gender  , Age_scaled, age_p10  , weekend.factor  ,  S02OperativeUrgency  , S02PlannedProcSeverity  , asa  ,  PreopLOS.factor  ,  combined_DHx  , combined_PMHx  , diabetes.factor  ,  sysBP_scaled  , HR_scaled  ,  Anaesthetist_grade_combined.factor  , Surgeon_grade_combined.factor , abnormal_bloodtest.factor , S04BloodLoss , SiteCode,  CCUCapacityTimeofSurgery  )
 
 complete_case_data_mort30 <- complete_case_data_mort30[complete.cases(complete_case_data_mort30), ]
 
 # Complete case datset for 60 day mortality
 complete_case_data_mort60 <- patients_labelled6 %>% 
-  dplyr::select(mortality60.factor, icu_adm.factor,  S01Gender  , age_p10  , weekend.factor  ,  S02OperativeUrgency  , S02PlannedProcSeverity  , asa  ,  PreopLOS.factor  ,  combined_DHx  , combined_PMHx  , diabetes.factor  ,  sysBP_scaled  , HR_scaled  ,  Anaesthetist_grade_combined.factor  , Surgeon_grade_combined.factor , abnormal_bloodtest.factor , S04BloodLoss , SiteCode )
+  dplyr::select(mortality60.factor, icu_adm.factor,  S01Gender  , Age_scaled,age_p10  , weekend.factor  ,  S02OperativeUrgency  , S02PlannedProcSeverity  , asa  ,  PreopLOS.factor  ,  combined_DHx  , combined_PMHx  , diabetes.factor  ,  sysBP_scaled  , HR_scaled  ,  Anaesthetist_grade_combined.factor  , Surgeon_grade_combined.factor , abnormal_bloodtest.factor , S04BloodLoss , SiteCode,  CCUCapacityTimeofSurgery  )
 
 complete_case_data_mort60 <- complete_case_data_mort60[complete.cases(complete_case_data_mort60), ]
 ```
@@ -443,7 +440,7 @@ odds_ratio_table_complete_case_empty_random_effects_icu_adm <- complete_case_emp
 save(odds_ratio_table_complete_case_empty_random_effects_icu_adm, file = 'odds_ratio_table_complete_case_empty_random_effects_icu_adm.rda')
 random_parameters(complete_case_empty_random_effects_icu_adm)
 # variance = 0.95
-my.var_complete_case_empty_icu_adm <- 0.95 
+my.var_complete_case_empty_icu_adm <- 0.96
 MOR_complete_case_empty_icu_adm <- my.var_complete_case_empty_icu_adm %>% MOR()
 
 
@@ -886,7 +883,7 @@ log_odds_est_all_outcomes_regression_plot <-
                                 "30 day mortality"="#0c385c",
                                 "60 day mortality"="#1770b8")) +
   theme(plot.title=element_text(size=10)) +
-  ggtitle("Complete case analysis - logistic regresson results for all outcomes") +
+  ggtitle("") +
   theme(legend.position="none") +
   theme(axis.title.y = element_text(margin = margin(r = 20))) +
   theme(axis.title.x = element_text(margin = margin(t = 20)))
@@ -898,7 +895,7 @@ Note that only POMS outcome is plotted with IV results. For mortality estimates,
 # POMS
 ## Odds ratios
 load('poms_pars_model_log_odds_est.rda')
-iv_results_row <- c("Bivariate Probit", "icu_adm.factorTRUE", "", "", "", "", "", "", 0.9811726,	0.598903537,	1.607437)  # taken from bivariate_probit_results_pars_mv.rda
+iv_results_row <- c("Bivariate Probit", "icu_adm.factorTRUE", "", "", "", "", "", "", 1.001,	0.61,	1.64)  # taken from bivariate_probit_results_pars_mv.rda
 age_cat_y1 <- poms_pars_model_log_odds_est %>% 
   mutate(or_est = exp(estimate),
          or_min95 = exp(conf.low),
@@ -948,7 +945,7 @@ POMS_all_results_plot_publication <- ggplot(age_cat_y1_pub, aes(Model, or_est)) 
 ### Average Treatment effects (aka marginal effects)
  
 a <- marginal_effects_table_pars_log_reg[1,]
-b <- c("icu_adm.factorTRUE", -0.002, 0.031, -0.08, 0.940, -0.062, 0.058, "Bivariate Probit IV analysis") # ATE results are obtained when running the Stata script above. Results are manually copied across from Stata.
+b <- c("icu_adm.factorTRUE", 0.0002, 0.031, 0.01, 0.996, -0.060, 0.061, "Bivariate Probit IV analysis") # ATE results are obtained when running the Stata script above. Results are manually copied across from Stata.
 
 POMS_marginal_effects_results <- rbind(a,b) %>%  
   dplyr::select("model", everything()) %>% 
@@ -977,7 +974,7 @@ POMS_marginal_effects_results_plot <-
 a <- av_marg_eff_POMS_unadj %>% mutate(Analysis = "Unadjusted regression")
 b <- marginal_effects_table_pars_log_reg[1,c(1,2,3,4,5,6,7)] %>%  mutate(Analysis = "Multilevel multivariable regression")
 ame_log_reg <- rbind(a,b)
-c <- c("icu_adm.factorTRUE", -0.002, 0.031, -0.08, 0.940, -0.062, 0.058, "Bivariate Probit IV analysis")
+c <- c("icu_adm.factorTRUE", 0.0002, 0.031, 0.01, 0.996, -0.060, 0.061, "Bivariate Probit IV analysis")
 
 ame_iv_log_combined <- rbind(ame_log_reg, c) %>% 
   mutate(AME = as.numeric(AME),
@@ -1108,7 +1105,7 @@ Create dataset of only 'planned' CCU admissions
 ```{r}
 planned_icu_only_imputed <- patients_labelled6_imputed %>% 
   filter(S07UnplannedDayOfSurgeryIcuHduPacuAdmission == "N" | is.na(S07UnplannedDayOfSurgeryIcuHduPacuAdmission))
-# 211 patients excluded
+# 210 patients excluded
 
 save(planned_icu_only_imputed, file = 'planned_icu_only_imputed.rda')
 load(file = 'planned_icu_only_imputed.rda')
@@ -1590,7 +1587,7 @@ Note that only POMS outcome is plotted with IV results. For mortality estimates,
 # POMS
 ## Odds ratios
 load('planned_icu_only_imputed_poms_pars_model_log_odds_est.rda')
-iv_results_row <- c("Bivariate Probit", "icu_adm.factorTRUE", "", "", "", "", "", "", 0.8679841,	0.5490999,	1.372057) # taken from IV results table above
+iv_results_row <- c("Bivariate Probit", "icu_adm.factorTRUE", "", "", "", "", "", "", 0.88,	0.56,	1.40) # taken from IV results table above
       
 age_cat_y1 <- planned_icu_only_imputed_poms_pars_model_log_odds_est %>% 
   mutate(or_est = exp(estimate),
@@ -1640,7 +1637,7 @@ planned_icu_only_imputed_POMS_all_results_plot_publication <- ggplot(age_cat_y1_
 ### Average Treatment effects (aka marginal effects)
  
 a <- planned_icu_only_imputed_marginal_effects_table_pars_log_reg[1,]
-b <- c("icu_adm.factorTRUE", -0.015, 0.024, -0.62, 0.533, -0.06, 0.03, "Bivariate Probit IV analysis")
+b <- c("icu_adm.factorTRUE", -0.013, 0.024, -0.53, 0.593, -0.06, 0.03, "Bivariate Probit IV analysis")
 
 ## Plot mv logistic regression vs Bivariate probit
 POMS_marginal_effects_results <- rbind(a,b) %>%  
@@ -1671,7 +1668,7 @@ b <- planned_icu_only_imputed_marginal_effects_table_pars_log_reg[1,c(1,2,3,4,5,
 
 ame_log_reg <- rbind(a,b)
 
-c <- c("icu_adm.factorTRUE", -0.015, 0.024, -0.62, 0.533, -0.06, 0.03, "Bivariate Probit IV analysis")
+c <- c("icu_adm.factorTRUE", -0.013, 0.024, -0.53, 0.593, -0.06, 0.03, "Bivariate Probit IV analysis")
 
 ame_iv_log_combined <- rbind(ame_log_reg, c) %>% 
   mutate(AME = as.numeric(AME),
@@ -2279,12 +2276,12 @@ SORT_levels_bivariate_probit_marginal_results <- data.frame(
                     stringsAsFactors = FALSE)
 
 # Add ATE results into dataframe
-SORT_levels_bivariate_probit_marginal_results[1,] <-  c("icu_adm.factorTRUE", -0.012, 0.025, -0.48, 0.631, -0.061, 0.037, "Overall")
-SORT_levels_bivariate_probit_marginal_results[2,] <-  c("icu_adm.factorTRUE", 0.071, 0.076, 0.94, 0.348, -0.077, 0.22, "1+")
-SORT_levels_bivariate_probit_marginal_results[3,] <-  c("icu_adm.factorTRUE", 0.029, 0.101, 0.29, 0.772, -0.169, 0.227, "2+")
-SORT_levels_bivariate_probit_marginal_results[4,] <-  c("icu_adm.factorTRUE", -0.016, 0.11, -0.15, 0.883, -0.23, 0.20, "3+")
-SORT_levels_bivariate_probit_marginal_results[5,] <-  c("icu_adm.factorTRUE", -0.109, 0.14, -0.78, 0.436, -0.383, 0.165, "4+")
-SORT_levels_bivariate_probit_marginal_results[6,] <-  c("icu_adm.factorTRUE", -0.178, 0.127, -1.40, 0.160, -0.428, 0.071, "5+")
+SORT_levels_bivariate_probit_marginal_results[1,] <-  c("icu_adm.factorTRUE", -0.010, 0.025, -0.38, 0.701, -0.059, 0.040, "Overall")
+SORT_levels_bivariate_probit_marginal_results[2,] <-  c("icu_adm.factorTRUE", 0.072, 0.077, 0.94, 0.345, -0.078, 0.22, "1+")
+SORT_levels_bivariate_probit_marginal_results[3,] <-  c("icu_adm.factorTRUE", 0.023, 0.10, 0.23, 0.817, -0.174, 0.22, "2+")
+SORT_levels_bivariate_probit_marginal_results[4,] <-  c("icu_adm.factorTRUE", -0.022, 0.11, -0.20, 0.838, -0.24, 0.19, "3+")
+SORT_levels_bivariate_probit_marginal_results[5,] <-  c("icu_adm.factorTRUE", -0.11, 0.13, -0.82, 0.415, -0.37, 0.15, "4+")
+SORT_levels_bivariate_probit_marginal_results[6,] <-  c("icu_adm.factorTRUE", -0.186, 0.127, -1.47, 0.142, -0.435, 0.062, "5+")
 
 # Recode variables in dataframe
 SORT_levels_bivariate_probit_marginal_results <- SORT_levels_bivariate_probit_marginal_results %>% 
@@ -2768,11 +2765,11 @@ variety_instruments_IV_AME_results <- data.frame(
                     stringsAsFactors = FALSE)
 
 # Add ATE results into dataframe
-variety_instruments_IV_AME_results[1,] <-  c("icu_adm.factorTRUE", -0.012, 0.025, -0.48, 0.631, -0.061, 0.037, "Available CCU beds (Empty + Discharge ready)")
-variety_instruments_IV_AME_results[2,] <-  c("icu_adm.factorTRUE", -0.024, 0.025, -0.98, 0.327, -0.073, 0.024, "Empty CCU Beds")
-variety_instruments_IV_AME_results[3,] <-  c("icu_adm.factorTRUE", -0.037, 0.024, -1.56, 0.120, -0.083, 0.009, "Empty CCU Beds: Categories (0 vs 2+ beds)")
-variety_instruments_IV_AME_results[4,] <-  c("icu_adm.factorTRUE", -0.033, 0.24, -1.39, 0.166, -0.079, 0.014, "Empty CCU Beds: Categories (0,1,2+ beds)")
-variety_instruments_IV_AME_results[5,] <-  c("icu_adm.factorTRUE", -0.032, 0.025, -1.29, 0.198, -0.082, 0.017, "Proportion of CCU beds that are empty")
+variety_instruments_IV_AME_results[1,] <-  c("icu_adm.factorTRUE", -0.010, 0.025, -0.38, 0.701, -0.059, 0.040, "Available CCU beds (Empty + Discharge ready)")
+variety_instruments_IV_AME_results[2,] <-  c("icu_adm.factorTRUE", -0.021, 0.025, -0.85, 0.397, -0.071, 0.028, "Empty CCU Beds")
+variety_instruments_IV_AME_results[3,] <-  c("icu_adm.factorTRUE", -0.033, 0.024, -1.38, 0.168, -0.081, 0.014, "Empty CCU Beds: Categories (0 vs 2+ beds)")
+variety_instruments_IV_AME_results[4,] <-  c("icu_adm.factorTRUE", -0.030, 0.024, -1.24, 0.214, -0.078, 0.017, "Empty CCU Beds: Categories (0,1,2+ beds)")
+variety_instruments_IV_AME_results[5,] <-  c("icu_adm.factorTRUE", -0.029, 0.026, -1.13, 0.258, -0.080, 0.021, "Proportion of CCU beds that are empty")
 
 # Recode variables to make more interpretable
 variety_instruments_IV_AME_results <- variety_instruments_IV_AME_results %>% 
@@ -2887,7 +2884,7 @@ combined_variety_instruments_pub_plot <- combined_variety_instruments_pub_plot +
 ```
 
 
-# Calcuate C-stat for models
+# Calculate C-stat for models
 
 ## Main analyses
 Models for investigating variability in probability of postoperative CCU admission between hospital sites
@@ -2919,7 +2916,7 @@ DescTools::Cstat(x = predict(POMS_impute_norm_random_effect, method="response"),
 DescTools::Cstat(x = predict(mort30_impute_norm_unadj, method="response"),                                                                     resp = model.response(model.frame(mort30_impute_norm_unadj))) # 0.65
 
 ## Random effects
-DescTools::Cstat(x = predict(mort30_impute_norm_random_effect, method="response"),                                                                     resp = model.response(model.frame(mort30_impute_norm_random_effect))) # 0.92
+DescTools::Cstat(x = predict(mort30_impute_norm_random_effect, method="response"),                                                                     resp = model.response(model.frame(mort30_impute_norm_random_effect))) # 0.93
 
 # mort 60
 ## Unadj 
@@ -2995,7 +2992,7 @@ DescTools::Cstat(x = predict(log_mort60_pars_random_effect, method="response"), 
 Models for investigating variability in probability of postoperative CCU admission between hospital sites
 ```{r}
 ## Model A
-DescTools::Cstat(x = predict(planned_only_empty_random_effects_icu_adm, method="response"),                                                                     resp = model.response(model.frame(planned_only_empty_random_effects_icu_adm))) # 0.76
+DescTools::Cstat(x = predict(planned_only_empty_random_effects_icu_adm, method="response"),                                                                     resp = model.response(model.frame(planned_only_empty_random_effects_icu_adm))) # 0.77
 
 ## Model B
 DescTools::Cstat(x = predict(planned_icu_only_imputed_log_ccu_pars_random_effect_critical_adverse_speciality_include, method="response"),                                                                     resp = model.response(model.frame(planned_icu_only_imputed_log_ccu_pars_random_effect_critical_adverse_speciality_include))) # 0.94
@@ -3056,13 +3053,13 @@ DescTools::Cstat(x = predict(log_poms_age_cat_impute_norm_pars_SORT1over_clean_r
 DescTools::Cstat(x = predict(log_poms_age_cat_impute_norm_pars_SORT2over_clean_random_effect, method="response"),                                                                     resp = model.response(model.frame(log_poms_age_cat_impute_norm_pars_SORT2over_clean_random_effect))) # 0.75
 
 ## 3+
-DescTools::Cstat(x = predict(log_poms_age_cat_impute_norm_pars_sort3over_clean_random_effect, method="response"),                                                                     resp = model.response(model.frame(log_poms_age_cat_impute_norm_pars_sort3over_clean_random_effect))) # 0.72
+DescTools::Cstat(x = predict(log_poms_age_cat_impute_norm_pars_sort3over_clean_random_effect, method="response"),                                                                     resp = model.response(model.frame(log_poms_age_cat_impute_norm_pars_sort3over_clean_random_effect))) # 0.73
 
 ## 4+
-DescTools::Cstat(x = predict(log_poms_age_cat_impute_norm_pars_sort4over_clean_random_effect, method="response"),                                                                     resp = model.response(model.frame(log_poms_age_cat_impute_norm_pars_sort4over_clean_random_effect))) # 0.69
+DescTools::Cstat(x = predict(log_poms_age_cat_impute_norm_pars_sort4over_clean_random_effect, method="response"),                                                                     resp = model.response(model.frame(log_poms_age_cat_impute_norm_pars_sort4over_clean_random_effect))) # 0.70
 
 ## 5+
-DescTools::Cstat(x = predict(log_poms_age_cat_impute_norm_pars_sort5over_clean_random_effect, method="response"),                                                                     resp = model.response(model.frame(log_poms_age_cat_impute_norm_pars_sort5over_clean_random_effect))) # 0.68
+DescTools::Cstat(x = predict(log_poms_age_cat_impute_norm_pars_sort5over_clean_random_effect, method="response"),                                                                     resp = model.response(model.frame(log_poms_age_cat_impute_norm_pars_sort5over_clean_random_effect))) # 0.69
 ```
 
 
